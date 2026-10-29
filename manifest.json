@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "YouTube 自动跳过广告",
+  "version": "1.2.4",
+  "description": "YouTube 播放广告时自动跳过：检测到官方「跳过」按钮即自动点击；可快进的插片广告直接播完并自动关闭部分贴片广告。不拦截网络请求、不屏蔽页面内容。",
+  "permissions": ["storage"],
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "YouTube 自动跳过广告",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.youtube.com/*",
+        "https://m.youtube.com/*",
+        "https://music.youtube.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}

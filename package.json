@@ -1,0 +1,12 @@
+{
+  "name": "youtube-auto-skip",
+  "version": "1.2.4",
+  "private": true,
+  "description": "Chrome 扩展：YouTube 广告自动跳过",
+  "scripts": {
+    "test": "node test/harness.js"
+  },
+  "devDependencies": {
+    "jsdom": "^24.0.0"
+  }
+}
