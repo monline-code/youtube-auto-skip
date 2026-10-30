@@ -844,21 +844,23 @@
   let epochActed = false; // 本次广告内是否真的执行过跳过动作（用于准确计数）
   let lastCoolLog = 0;    // "冷却中"提示的节流时间戳
 
-  // 调试心跳：空闲态（无广告）每 15s 一次，广告态（含倒计时）每 3s 一次；
-  // 状态发生切换（广告出现/消失、命中数变化）则立即输出，避免刷屏又不错过关键瞬间。
+  // 调试心跳：节奏按"真正的动作门控 strong(adStateStrong)"决定——
+  // 广告结束/空闲态（strong=false）每 15s 一次，仅可动手的广告态才 3s 一次。
+  // 之前用宽松的 adPlaying 决定节奏：广告结束后 .ad-interrupting / 残留覆盖层
+  // 仍让 adPlaying=true，导致按 3s 持续刷屏（实际并不会动作，纯噪音）。
   function emitDebugBeat() {
     const adShowing = !!document.querySelector('.ad-showing');
     const adPlaying = isAdPlaying();
+    const strong = adStateStrong();            // 是否真的会动播放器
     const hitCount = SKIP_SELECTORS.reduce((n, s) => n + queryAllSafe(s).length, 0);
-    const sig = (adPlaying ? 1 : 0) + '|' + (adShowing ? 1 : 0) + '|' + hitCount;
+    const sig = (strong ? 1 : 0) + '|' + (adPlaying ? 1 : 0) + '|' + (adShowing ? 1 : 0) + '|' + hitCount;
     const now = Date.now();
-    const state = adPlaying ? 'ad' : 'idle';
-    const interval = state === 'ad' ? 3000 : 15000;
+    const interval = strong ? 3000 : 15000;
     if (sig !== lastBeatSig || now - lastDebugBeat > interval) {
       lastBeatSig = sig;
       lastDebugBeat = now;
       const player = document.querySelector('#movie_player, .html5-video-player');
-      dlog('🔎 调试心跳：adPlaying=', adPlaying,
+      dlog('🔎 调试心跳：strong=', strong, '| adPlaying=', adPlaying,
         '| .ad-showing=', adShowing,
         '| playerCls=', player && player.className && String(player.className).slice(0, 80),
         '| 选择器命中数=', hitCount);

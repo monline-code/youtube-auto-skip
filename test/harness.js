@@ -48,7 +48,7 @@ function makeChrome(init) {
     },
   });
   return {
-    runtime: { id: 'test-ext', lastError: undefined, getManifest: () => ({ version: '1.2.4' }) },
+    runtime: { id: 'test-ext', lastError: undefined, getManifest: () => ({ version: '1.2.5' }) },
     storage: {
       sync: area(sync, 'sync'),
       local: area(local, 'local'),
