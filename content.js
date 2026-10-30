@@ -288,11 +288,24 @@
   function isSafeClickTarget(el) {
     if (!el || !el.tagName) return false;
     if (el.tagName === 'A') return false;
-    // 祖先里有链接 → 点击会跳转
-    if (el.closest && el.closest('a[href]')) return false;
-    // 广告创意 / "访问广告主" 区域
-    if (el.closest && el.closest('[class*="ytp-ad-clickable"], [class*="ytp-ad-visit-advertiser"]')) return false;
-    if (UNSAFE_CLASS_RE.test(classOf(el))) return false;
+    // 沿 Shadow DOM 边界逐层向上检查（v1.2.6）。
+    // closest() 不跨 shadow root：若跳过按钮藏在某个 <a> 宿主的 shadow tree 里，
+    // 单次 closest 返回 null → 会误判为"安全"，而 composed:true 的点击会冒泡到
+    // 宿主的 <a> 打开广告落地页（v1.2.3 弹窗根因的残留口子）。
+    // 这里用 getRootNode().host 逐层跳出 shadow，对每一层都检查链接/广告创意祖先。
+    let node = el;
+    let depth = 0;
+    while (node && depth++ < 20) {
+      // 当前 root 内的 <a href> 祖先 → 点击会跳转
+      if (node.closest && node.closest('a[href]')) return false;
+      // 广告创意 / "访问广告主" 区域
+      if (node.closest && node.closest('[class*="ytp-ad-clickable"], [class*="ytp-ad-visit-advertiser"]')) return false;
+      // 当前节点自身类名命中危险类（含 shadow 宿主）
+      if (UNSAFE_CLASS_RE.test(classOf(node))) return false;
+      let root = null;
+      try { root = node.getRootNode ? node.getRootNode() : null; } catch (_) { root = null; }
+      if (root && root.host) { node = root.host; } else { break; }
+    }
     return true;
   }
 

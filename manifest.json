@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "YouTube 自动跳过广告",
-  "version": "1.2.5",
+  "version": "1.2.6",
   "description": "YouTube 播放广告时自动跳过：检测到官方「跳过」按钮即自动点击；可快进的插片广告直接播完并自动关闭部分贴片广告。不拦截网络请求、不屏蔽页面内容。",
   "permissions": ["storage"],
   "icons": {

@@ -48,7 +48,7 @@ function makeChrome(init) {
     },
   });
   return {
-    runtime: { id: 'test-ext', lastError: undefined, getManifest: () => ({ version: '1.2.5' }) },
+    runtime: { id: 'test-ext', lastError: undefined, getManifest: () => ({ version: '1.2.6' }) },
     storage: {
       sync: area(sync, 'sync'),
       local: area(local, 'local'),
@@ -84,7 +84,7 @@ function makeVideo(win, opts) {
   return v;
 }
 
-async function loadPage(html, { video, enabled = true } = {}) {
+async function loadPage(html, { video, enabled = true, debug = false } = {}) {
   const dom = new JSDOM(`<!DOCTYPE html><body>${html}</body>`, {
     runScripts: 'outside-only',
     pretendToBeVisual: true,
@@ -96,10 +96,15 @@ async function loadPage(html, { video, enabled = true } = {}) {
   });
   const player = win.document.querySelector('#movie_player');
   if (video && player) player.appendChild(video);
-  win.chrome = makeChrome({ enabled });
+  win.chrome = makeChrome({ enabled, debug });
+  // debug 模式下截获扩展日志，供测试断言（如"是否为某按钮调度了点击"）
+  const logs = [];
+  if (debug) {
+    win.console.log = (...a) => { logs.push(a.map(String).join(' ')); };
+  }
   win.eval(CODE);
   await sleep(60);   // 等 storage 回调 -> start()
-  return { win, chrome: win.chrome, player };
+  return { win, chrome: win.chrome, player, logs };
 }
 
 const results = [];
@@ -168,6 +173,36 @@ function check(name, pass, detail) {
     await sleep(1500);
     const t = win.document.querySelector('video').__getTime();
     check('E 已禁用时不动作', Math.abs(t - 0.5) < 0.01, `currentTime=${t}`);
+  }
+
+  // ---------- F: 跳过按钮藏在 <a> 宿主 shadow 内 -> 绝不能被调度/点击（S1 防御纵深） ----------
+  // 第一道闸是 scheduleClick 里的 `document.contains(el)`：节点在 shadow root 内时
+  // document.contains() 为 false，点击会被直接放弃。因此本用例断言两件事：
+  //   (1) 按钮从未被点击；(2) 扩展从未为该按钮打印"准备点击"/排入队列。
+  // 旧 isSafeClickTarget 用 closest('a[href]')（不跨 shadow）会误判安全并排入队列，
+  // v1.2.6 沿 getRootNode().host 逐层检查后，连排入队列都不会发生。
+  {
+    const html = `
+      <div id="movie_player" class="html5-video-player ad-showing">
+        <a href="https://advertiser.example/landing">
+          <div id="ad-host"></div>
+        </a>
+      </div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 15, currentTime: 0.5, paused: false });
+    const { win, logs } = await loadPage(html, { video, debug: true });
+    let clicks = 0;
+    const host = win.document.getElementById('ad-host');   // div 是合法 shadow 宿主
+    const shadow = host.attachShadow({ mode: 'open' });
+    const btn = win.document.createElement('button');
+    btn.className = 'ytp-skip-ad-button';
+    btn.textContent = '跳过';
+    btn.addEventListener('click', () => { clicks += 1; });
+    shadow.appendChild(btn);
+    await sleep(2000);   // 留足深度扫描（800ms 节流）+ tick
+    const scheduled = logs.filter((l) => l.indexOf('准备点击') >= 0 && l.indexOf('ytp-skip-ad-button') >= 0);
+    check('F shadow 内跳过按钮既不被点击也不被调度（防落地页弹窗）',
+      clicks === 0 && scheduled.length === 0,
+      `clicks=${clicks}, 调度=${scheduled.length}`);
   }
 
   const failed = results.filter((r) => !r.pass);
