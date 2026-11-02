@@ -169,7 +169,7 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.3.8'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.3.9'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
@@ -837,17 +837,45 @@
     '.ytp-ad-duration-remaining',
   ];
 
+  // v1.3.9：广告态判定加入"残留识别"。
+  // 背景：广告结束后 .ad-showing 可能残留，此时正片在播。v1.3.8 现场一支 341.8s
+  // 正片被当成广告，干等近 10 分钟、统计虚报 360s。
+  // 规则（分层，尽量不误伤既有能力）：
+  //   1) 有可见广告覆盖层 → 明确是广告（正片不会有广告覆盖层）
+  //   2) 没有 .ad-showing → 只认覆盖层（新版 UI 可能不挂类名）
+  //   3) 有 .ad-showing 但视频时长 > AD_MAX_DURATION（正片量级）→ 必须是真广告：
+  //      还要存在"可见跳过目标"，否则判残留（退出等待/统计）
+  //   4) 其余（短广告 / dur 还没读出）→ 信任 .ad-showing（保留 shadow、0×0 按钮等能力）
+  // 注意：视频层强跳不看这里，它由 isRealVideoAd()（仅 .ad-showing）单独驱动。
   function computeAdState() {
     const p = document.querySelector('#movie_player, .html5-video-player');
-    if (p && p.classList && p.classList.contains('ad-showing')) return true;
-    if (document.querySelector('.ad-showing')) return true;
-    // 新版广告 UI 有时不挂 ad-showing，靠广告独有覆盖层判定
-    for (const sel of STRONG_AD_SELECTORS) {
+    const hasAdClass = (p && p.classList && p.classList.contains('ad-showing'))
+      || !!document.querySelector('.ad-showing');
+
+    // 1) 可见广告覆盖层
+    for (const sel of AD_OVERLAY_SELECTORS) {
       let el = null;
       try { el = document.querySelector(sel); } catch (_) { el = null; }
       if (el && isVisible(el)) return true;
     }
-    return false;
+
+    // 2) 无 ad-showing：只认覆盖层
+    if (!hasAdClass) return false;
+
+    // 3) 有 ad-showing 但时长是"正片量级"：要求存在可见跳过目标，否则判残留
+    const video = currentVideo();
+    const dur = video && video.duration;
+    if (isFinite(dur) && dur > AD_MAX_DURATION) {
+      for (const sel of SKIP_SELECTORS) {
+        for (const el of queryAllSafe(sel)) {
+          if (isTargetVisible(el)) return true;
+        }
+      }
+      return false;
+    }
+
+    // 4) 短广告 / 时长未知：信任 ad-showing
+    return true;
   }
 
   // force=true：跳过缓存重新判定。用于"延迟点击回调"这类跨 tick 的复检——
@@ -1458,6 +1486,7 @@
   let lastBeatSig = '';   // 上次心跳的状态签名，用于"状态变化立即输出"
   let adEpoch = 0;        // 每进入一次广告 +1（仅用于日志编号）
   let adStateSince = 0;   // 本次强广告态开始时间（0 = 当前不在广告）
+  let lastUiAt = 0;       // v1.3.9：最后一次看到"可见广告 UI"的时间（统计剔除残留段用）
   let epochActed = false; // 本次广告内是否真的执行过跳过动作（用于准确计数）
   let lastCoolLog = 0;    // "冷却中"提示的节流时间戳
 
@@ -1500,11 +1529,15 @@
     adStateCache = undefined;
 
     // 强广告态跟踪：进入时记时间 + epoch+1，退出时清零
-    if (adStateStrong()) {
+    // v1.3.9：这里改用 isRealVideoAd()（仅 .ad-showing）驱动强跳窗口——
+    // 广告 UI 还没渲染的瞬间也要能强跳。adStateStrong 现在是"可见 UI"双条件，
+    // 只服务点击/统计/心跳，不再当强跳开关，否则纯 .ad-showing 的广告会不强跳。
+    if (isRealVideoAd()) {
       if (!adStateSince) {
         adStateSince = Date.now();
         adEpoch += 1;
         epochActed = false;
+        lastUiAt = 0;          // v1.3.9：新广告，UI 时间重新记
         seekFails = 0;
         jumpTarget = 0;
         jumpEl = null;
@@ -1530,7 +1563,9 @@
         jumpDur = 0;
         endStallSince = 0;
         releaseRateBoost();                     // 把播放速度还原，别加速正片
-        const total = Date.now() - adStartedAt;
+        // v1.3.9：用"最后一次看到可见广告 UI 的时间"截止，剔除 .ad-showing 残留的正片段
+        const uiEnd = (lastUiAt && lastUiAt > adStartedAt) ? lastUiAt : Date.now();
+        const total = Math.max(1, uiEnd - adStartedAt);
         // v1.3.5：一行交代"这次广告的时间去哪了"。现场日志里 18.2 秒只有 1.8 秒
         // 在真的播广告，其余全是 readyState=0 的等待——但那是靠人工数出来的，
         // 现在直接打印，下次判断"该不该继续优化"不用再猜。
@@ -1552,6 +1587,10 @@
       }
       recordMainDur();
     }
+
+    // v1.3.9：记录"最后一次看到可见广告 UI"的时间。广告结束后 .ad-showing 可能残留，
+    // 但广告 UI 会先消失；统计用这个时间截止，避免把残留正片的时长算进广告总时长。
+    if (adStateSince && adStateStrong()) lastUiAt = Date.now();
 
     // v1.3.5：广告期间每 tick 采一次样，累计"媒体没就绪"的时长，
     // 并在媒体刚就绪时补一条 🎬，把"我们的反应"和"广告自己的加载"分开计时。

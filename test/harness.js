@@ -682,6 +682,40 @@ function check(name, pass, detail) {
       `skipped=${ch.__local.skipped}`);
   }
 
+  // ---------- AF: 有可见广告 UI -> 仍判广告态并点击（双条件不误伤真广告）----------
+  // v1.3.9 把 adStateStrong 收紧为"必须有可见广告 UI"。这里确保：广告 UI 在时
+  // （覆盖层可见 + 跳过按钮可见），点击路径照常工作，不会被新判据误伤。
+  {
+    const html = `
+      <div id="movie_player" class="html5-video-player ad-showing">
+        <div class="ytp-ad-player-overlay"></div>
+        <div class="ytp-skip-ad-button">跳过广告</div>
+      </div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 15, currentTime: 0.5, paused: false });
+    const { win, logs } = await loadPage(html, { video, debug: true });
+    let clicks = 0;
+    win.document.querySelector('.ytp-skip-ad-button').addEventListener('click', () => { clicks += 1; });
+    await sleep(1200);
+    const beat = logs.find((l) => l.indexOf('调试心跳') >= 0) || '';
+    check('AF 有可见广告 UI 时判为广告态并点击',
+      clicks > 0 && beat.indexOf('strong= true') >= 0, `clicks=${clicks}, 心跳=${beat.slice(0, 46)}`);
+  }
+
+  // ---------- AG: .ad-showing 残留（无任何可见广告 UI）-> 判为非广告态 ----------
+  // v1.3.8 现场：广告结束后 .ad-showing 残留、正片在播，但扩展每 tick 仍当广告处理，
+  // 干等近 10 分钟、统计虚报 360s。v1.3.9 要求：没有任何可见广告 UI 时，心跳判 non-ad。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 341.8, currentTime: 0, paused: false });
+    const { win, logs } = await loadPage(html, { video, debug: true });
+    await sleep(1500);
+    const beat = logs.find((l) => l.indexOf('调试心跳') >= 0) || '';
+    const t = win.document.querySelector('video').__getTime();
+    check('AG ad-showing 残留（无广告 UI）判为非广告态且不动进度',
+      beat.indexOf('strong= false') >= 0 && Math.abs(t) < 0.01,
+      `心跳=${beat.slice(0, 46)}, currentTime=${t.toFixed(2)}`);
+  }
+
   const failed = results.filter((r) => !r.pass);
   console.log(`\n共 ${results.length} 项，通过 ${results.length - failed.length}，失败 ${failed.length}`);
   process.exit(failed.length ? 1 : 0);
