@@ -138,7 +138,7 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.3.5'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.3.6'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
@@ -277,8 +277,23 @@
   // v1.3.3：每条日志带"相对页面加载的毫秒数"。之前排查全靠 console 行序猜时序，
   // 分不清"200ms 内完成"和"卡了 6 秒"——加了时间戳才能把体感延迟量化。
   const LOG_T0 = Date.now();
+
+  // v1.3.6：调试日志环形缓冲，供 popup「复制调试日志」一键导出。
+  // 现场排查最大的时间浪费不是看日志，而是从几百行 YouTube 噪音（preload、
+  // CSP、serviceworker）里把十几行扩展输出翻出来——长文本粘贴还会被截断，
+  // 而截断点常常正好落在广告那一段。这里只留自己的行，导出即用。
+  const LOG_BUF_MAX = 500;      // 约 3~5 次广告的量，超出丢最旧的
+  const logBuf = [];
+  function pushLog(line) {
+    if (logBuf.length >= LOG_BUF_MAX) logBuf.shift();
+    logBuf.push(line);
+  }
+
   function dlog(...args) {
-    if (debug) console.log('[YT-AutoSkip] +' + (Date.now() - LOG_T0) + 'ms', ...args);
+    if (!debug) return;
+    const ts = '[YT-AutoSkip] +' + (Date.now() - LOG_T0) + 'ms';
+    console.log(ts, ...args);
+    pushLog(ts + ' ' + args.join(' '));
   }
 
   // 节流版调试日志：同一 key 每 3s 最多打印一次，避免广告期间刷屏
@@ -302,6 +317,21 @@
     lastVskipWhy = why;
     lastVskipAt = now;
     dlog('⏩ 本 tick 未动进度：', why, extra);
+  }
+
+  // v1.3.6：供 popup 导出日志。只回传本扩展自己的行，不带页面噪音。
+  if (chrome.runtime && chrome.runtime.onMessage) {
+    chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+      if (!msg || msg.type !== 'ytAutoSkip:dumpLog') return undefined;
+      sendResponse({
+        version: VERSION,
+        debug: !!debug,
+        count: logBuf.length,
+        text: logBuf.join('\n'),
+      });
+      if (msg.clear) logBuf.length = 0;
+      return true;
+    });
   }
 
   function loadDebug() {

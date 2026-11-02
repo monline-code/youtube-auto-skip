@@ -32,6 +32,7 @@ function makeChrome(init) {
   const sync = Object.assign({ enabled: true, debug: false }, init || {});
   const local = { skipped: 0 };
   const listeners = [];
+  const msgListeners = [];
   const fire = (area, changes) => listeners.forEach((l) => l(changes, area));
   const area = (bag, name) => ({
     get(defaults, cb) {
@@ -49,7 +50,12 @@ function makeChrome(init) {
     },
   });
   return {
-    runtime: { id: 'test-ext', lastError: undefined, getManifest: () => ({ version: require('../manifest.json').version }) },
+    runtime: {
+      id: 'test-ext',
+      lastError: undefined,
+      getManifest: () => ({ version: require('../manifest.json').version }),
+      onMessage: { addListener: (l) => msgListeners.push(l) },
+    },
     storage: {
       sync: area(sync, 'sync'),
       local: area(local, 'local'),
@@ -57,6 +63,12 @@ function makeChrome(init) {
         addListener: (l) => listeners.push(l),
         removeListener: (l) => { const i = listeners.indexOf(l); if (i >= 0) listeners.splice(i, 1); },
       },
+    },
+    // 模拟 popup -> content script 的消息往返（popup 的「复制调试日志」走这条）
+    __sendMessage: (msg) => {
+      let out;
+      msgListeners.forEach((l) => l(msg, {}, (r) => { out = r; }));
+      return out;
     },
     __local: local,
     __sync: sync,
@@ -536,6 +548,35 @@ function check(name, pass, detail) {
     check('W 广告结束打印耗时归因汇总',
       !!sum && !!ready && m && Number(m[1]) > 300,
       sum || '（没有汇总日志）');
+  }
+
+  // ---------- X: popup「复制调试日志」只回本扩展的行 ----------
+  // 现场日志动辄几百行 YouTube 噪音（preload / CSP / serviceworker），
+  // 手工从控制台挑行既慢又容易被长文本粘贴截断。改成由内容脚本自己攒缓冲。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 15, currentTime: 0.5, paused: false });
+    const { chrome: ch } = await loadPage(html, { video, debug: true });
+    await sleep(1200);
+    const resp = ch.__sendMessage({ type: 'ytAutoSkip:dumpLog' });
+    const ver = require('../manifest.json').version;
+    const ok = !!resp && resp.count > 0 && resp.version === ver
+      && /视频层强跳/.test(resp.text)
+      && String(resp.text).split('\n').every((l) => l.indexOf('[YT-AutoSkip]') >= 0);
+    check('X popup 可一键导出扩展日志（不含页面噪音）',
+      ok, resp ? `count=${resp.count}, version=${resp.version}` : '无响应');
+  }
+
+  // ---------- Y: 调试关闭时导出为空，且不误报"有日志" ----------
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 15, currentTime: 0.5, paused: false });
+    const { chrome: ch } = await loadPage(html, { video, debug: false });
+    await sleep(900);
+    const resp = ch.__sendMessage({ type: 'ytAutoSkip:dumpLog' });
+    check('Y 调试关闭时导出为空并如实回报 debug=false',
+      !!resp && resp.count === 0 && resp.debug === false,
+      resp ? `count=${resp.count}, debug=${resp.debug}` : '无响应');
   }
 
   const failed = results.filter((r) => !r.pass);

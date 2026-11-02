@@ -45,6 +45,14 @@
       font-size: 11px; color: #1a73e8; background: none; border: none;
       cursor: pointer; padding: 0; margin-top: 8px;
     }
+    .dump {
+      width: 100%; padding: 6px 8px; margin-top: 4px;
+      font-size: 12px; color: #1a73e8; background: #f4f7fe;
+      border: 1px solid #d5e0f7; border-radius: 6px; cursor: pointer;
+    }
+    .dump:hover { background: #e8f0fe; }
+    .dump:active { background: #dbe6fd; }
+    .dumpHint { font-size: 11px; color: #777; margin-top: 6px; min-height: 14px; }
   </style>
 </head>
 <body>
@@ -65,7 +73,9 @@
   </div>
   <div class="count">已累计自动跳过：<b id="skipped">0</b> 次</div>
   <button class="reset" id="reset">清零计数</button>
-  <div class="hint">提示：仅点击 YouTube 官方提供的「跳过广告」按钮，不会屏蔽广告本身。遇到倒计时结束时才会点击。开启「调试日志」后，到 YouTube 页面按 F12 看控制台输出，可帮助定位未跳过的问题。</div>
+  <button class="dump" id="dump">复制调试日志</button>
+  <div class="dumpHint" id="dumpHint"></div>
+  <div class="hint">提示：仅点击 YouTube 官方提供的「跳过广告」按钮，不会屏蔽广告本身。遇到倒计时结束时才会点击。开启「调试日志」后，可在广告结束后点「复制调试日志」，只导出本扩展的输出（不含页面噪音），可直接贴出。</div>
   <script src="popup.js"></script>
 </body>
 </html>
