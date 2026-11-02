@@ -731,21 +731,59 @@ function check(name, pass, detail) {
       `currentTime=${t.toFixed(2)}, 有强跳日志=${logs.some((l) => l.indexOf('强跳') >= 0)}`);
   }
 
-  // ---------- AI: 残留态（正片时长 + 可见空壳按钮）-> 8s 判残留退出（v1.4.0）----------
-  // 现场：广告结束后 .ad-showing 残留、媒体变成 3225s 的正片，跳过按钮还是 86x36 的空壳。
-  // v1.3.9：点满预算 → 每 4 秒刷"冷却/排队中" → 📊 永不触发，一挂 700 秒。
+  // ---------- AI: 真残留（媒体时长 = 正片时长 + 可见空壳按钮）-> 8s 判残留退出 ----------
+  // 现场（v1.3.8）：广告结束后 .ad-showing 残留、播放器里跑的是正片，跳过按钮还是
+  // 86x36 的空壳。旧版点满预算 → 每 4 秒刷"冷却/排队中" → 📊 永不触发，一挂 700 秒。
+  // v1.4.1：判据从"时长 > 300s"改成"时长 = mainDur"。这里先让正片播 700ms 记下
+  // mainDur=3225，再挂 .ad-showing 模拟残留。
   {
-    const html = `<div id="movie_player" class="html5-video-player ad-showing">
+    const html = `<div id="movie_player" class="html5-video-player">
         <button class="ytp-skip-ad-button">跳过</button>
       </div>`;
-    const video = makeVideo(new JSDOM('').window, { duration: 3225, currentTime: 3.4, paused: false });
-    const { logs } = await loadPage(html, { video, debug: true });
+    const opts = { duration: 3225, currentTime: 3.4, paused: false };
+    const video = makeVideo(new JSDOM('').window, opts);
+    const { player, logs } = await loadPage(html, { video, debug: true });
+    await sleep(700);                       // 非广告态：记下 mainDur = 3225
+    player.classList.add('ad-showing');     // 广告结束，类名残留
     await sleep(10000);
     const residual = logs.some((l) => l.indexOf('判定为广告态残留') >= 0);
     const summary = logs.some((l) => l.indexOf('📊 广告结束') >= 0);
-    const clicks = logs.filter((l) => l.indexOf('🖱️ 实际点击') >= 0).length;
-    check('AI 正片量级残留 8s 内退出、不写广告汇总',
-      residual && !summary && clicks <= 4, `残留=${residual}, 📊=${summary}, 点击=${clicks}`);
+    const t = video.__getTime();
+    check('AI 残留（时长与正片一致）8s 内退出、不碰进度、不写广告汇总',
+      residual && !summary && Math.abs(t - 3.4) < 0.01,
+      `残留=${residual}, 📊=${summary}, ct=${t.toFixed(2)}`);
+  }
+
+  // ---------- AJ: 长广告（时长是广告自己的，与正片明显不同）-> 照样强跳 ----------
+  // v1.4.1 现场：那支广告本身是 3225 秒，mainDur= 5536.081。旧规则只看"3225 > 300"
+  // 就判成正片，一句 🚫 之后 700 秒不再动手，用户实打实看了 16 分钟广告。
+  // 正确判据是"和 mainDur 比"：差得远 → 这不是正片 → 多长都能推。
+  {
+    const html = `<div id="movie_player" class="html5-video-player"></div>`;
+    const opts = { duration: 5536, currentTime: 300, paused: false };
+    const video = makeVideo(new JSDOM('').window, opts);
+    const { player, logs } = await loadPage(html, { video, debug: true });
+    await sleep(700);                        // 记下 mainDur = 5536
+    opts.duration = 3225;                    // 切到那支 53 分钟的长广告
+    video.currentTime = 3.4;
+    player.classList.add('ad-showing');
+    await sleep(1600);
+    const t = video.__getTime();
+    check('AJ 长广告（时长 ≠ 正片）照样强跳到结尾',
+      t > 3224, `currentTime=${t.toFixed(2)}, 有长广告日志=${logs.some((l) => l.indexOf('长广告强跳') >= 0)}`);
+  }
+
+  // ---------- AK: 长时长 + mainDur 未知 -> 仍然不推（AJ 的安全边界）----------
+  // 打开链接先播广告时没有任何参照。宁可漏跳这一支，也不能把正片推到大结局。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 3225, currentTime: 3.4, paused: false });
+    const { logs } = await loadPage(html, { video, debug: true });
+    await sleep(2500);
+    const t = video.__getTime();
+    const explain = logs.filter((l) => l.indexOf('不参与强跳') >= 0).length;
+    check('AK 没有正片时长作参照时不碰长媒体',
+      Math.abs(t - 3.4) < 0.01 && explain >= 1, `ct=${t.toFixed(2)}, 解释行=${explain}`);
   }
 
   const failed = results.filter((r) => !r.pass);

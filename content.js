@@ -178,6 +178,21 @@
  *    静默只在"媒体时长变回广告量级"或"广告 UI 消失"时解除 —— 真广告来了照样跳
  *  - [改动] 心跳 3s 档只在"可能真的会动手"时用（有按钮，或媒体是广告量级），
  *    其余一律 15s。残留态不再每 3s 刷一行
+ *
+ * v1.4.1：修正 v1.4.0 的根因误判 —— "时长 > 300s" 不是正片，可能真是长广告
+ *  - [事故] 用户指出：那 16 分钟是**真实在播广告**，不是残留。回看日志：
+ *    `📺 检测到广告开始（第 2 次）` 之后 dur 从 60.1 变成 3225，`ct` 一路
+ *    0 → 3.4 → 33.8 → … → 676 正常推进；`mainDur= 5536.081` 早就在那里了。
+ *    3225 与 5536 明显不同 = 这不是正片，可旧规则只看"3225 > 300"就判正片，
+ *    一句 🚫 之后 700 秒不再动手，还把结论写成"多半是 ad-showing 残留"。
+ *    —— 播放器报给这支广告的时长是 3225s，用户实打实看了 16 分钟仍没被跳过。
+ *  - [根因] 用绝对时长猜"是不是正片"从一开始就错。可靠判据是**和记录下来的
+ *    正片时长比**：|dur - mainDur| > 容差 → 已经证明这不是正片，多长都能跳。
+ *  - [改动] 新增 mainClipLike() / notMainClip()，强跳、广告态判定、窗口信号、
+ *    残留看门狗全部改用它们；AD_MAX_DURATION 降级为"mainDur 未知时的保守兜底"
+ *  - [改动] 残留看门狗改判"媒体时长≈正片"，不再拿 300s 当分界线 ——
+ *    否则长广告一进来就被当成残留退出，反而更跳不掉
+ *  - [日志] 🚫 不再断言"多半是残留"，改成说清"没有正片时长作参照，不敢推"
  */
 (() => {
   'use strict';
@@ -188,7 +203,7 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.4.0'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.4.1'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
@@ -892,10 +907,13 @@
     // 2) 无 ad-showing：只认覆盖层
     if (!hasAdClass) return false;
 
-    // 3) 有 ad-showing 但时长是"正片量级"：要求存在可见跳过目标，否则判残留
+    // 3) 有 ad-showing，但时长超出广告量级、又证明不了它不是正片（mainDur 未知）：
+    //    要求存在可见跳过目标，否则判残留。
+    //    v1.4.1：**已证明不是正片**的超长广告（notMainClip）直接信任。现场那支
+    //    3225s 的广告就是在这里被"时长 > 300s = 正片量级"误判成残留的。
     const video = currentVideo();
     const dur = video && video.duration;
-    if (isFinite(dur) && dur > AD_MAX_DURATION) {
+    if (isFinite(dur) && dur > AD_MAX_DURATION && !notMainClip(dur)) {
       for (const sel of SKIP_SELECTORS) {
         for (const el of queryAllSafe(sel)) {
           if (isTargetVisible(el)) return true;
@@ -938,13 +956,15 @@
   // `.ad-showing= false`、广告覆盖层却明明可见。用户看到的就是"广告在播，扩展不动手"。
   // 现在的口径：
   //   a) `.ad-showing` → 开窗（最硬的信号；此时媒体可能还没换源，dur 仍是正片，不能挡）
-  //   b) 可见广告覆盖层 **且** 媒体时长是广告量级 → 开窗（新版 UI 有时不挂类名）
-  // 覆盖层残留 + 正片时长（3225s / 5536s 这类）不开窗：那里本来也没有可跳的东西，
-  // 开窗只会换来每 40 秒一行"未动进度"和永不结束的广告态。
+  //   b) 可见广告覆盖层 **且** 时长不是正片（短广告，或已证明 ≠ mainDur 的长广告）→ 开窗
+  // 覆盖层残留 + 正片在播不开窗：那里本来也没有可跳的东西，开窗只会换来
+  // 每 40 秒一行"未动进度"和永不结束的广告态。
   function adWindowSignal() {
     if (isRealVideoAd()) return true;
     const dur = mediaDur();
-    if (!isFinite(dur) || dur > AD_MAX_DURATION) return false;
+    // v1.4.1：长广告（已证明不是正片）同样开窗 —— 否则覆盖层广告只要超过 5 分钟，
+    // 窗口就永远不开，用户看到的就是"广告在播、扩展一次都没动手"。
+    if (!isFinite(dur) || (dur > AD_MAX_DURATION && !notMainClip(dur))) return false;
     for (const sel of AD_FRAME_SELECTORS) {
       let el = null;
       try { el = document.querySelector(sel); } catch (_) { el = null; }
@@ -957,11 +977,12 @@
   // 为什么不能直接放开 [S2]：覆盖层信号在正片里也可能可见（#player-ads 常驻、
   // 跳过按钮会留 86x36 的空壳）。所以这里多加两个约束：
   //   a) 只认"广告创意层"选择器（AD_FRAME_SELECTORS），不含 #player-ads / 跳过按钮壳
-  //   b) 媒体时长必须是广告量级（>0 且 ≤ AD_MAX_DURATION）
+  //   b) 时长不能是正片：短广告（≤ AD_MAX_DURATION）直接放行；长广告必须已证明
+  //      ≠ mainDur（notMainClip）——v1.4.1 现场那支广告自己就有 3225 秒
   // 于是"覆盖层可见但正片在播"依然动不了进度——S2 的本意完整保留。
   function overlayOnlyAd() {
     const dur = mediaDur();
-    if (!isFinite(dur) || dur > AD_MAX_DURATION) return false;
+    if (!isFinite(dur) || (dur > AD_MAX_DURATION && !notMainClip(dur))) return false;
     for (const sel of AD_FRAME_SELECTORS) {
       let el = null;
       try { el = document.querySelector(sel); } catch (_) { el = null; }
@@ -974,7 +995,10 @@
   // 广告本质上是播放器在播另一段视频：把它的播放进度推到结尾，广告就立刻结束。
   // 这条路径绕开"按钮找不到 / 按钮是空壳 / shadow 点击无效"的所有问题，
   // 是保证"一定有跳过动作"的最后一道保险。
-  const AD_MAX_DURATION = 300;   // 只处理 ≤5 分钟的片子（广告），先把长视频排除
+  // v1.4.1：AD_MAX_DURATION 从"是不是正片"的判据降级为 **mainDur 未知时的保守兜底**。
+  // 现场那支广告自己就有 3225 秒（用户看了 16 分钟），拿 300 秒当界线必然误杀。
+  // 现在能不能跳由 mainClipLike / notMainClip（对比正片时长）决定。
+  const AD_MAX_DURATION = 300;   // mainDur 未知时"敢推"的最大时长（没有参照就别冒险）
   const AD_SKIP_MIN_WAIT = 200;    // 广告标记出现后至少等这么久再动手（等播放器把 video 挂上）
   const AD_SKIP_CONFIRM_MS = 800;  // 无法证明"不是正片"时（mainDur 未知）必须等满的确认窗口
   const VIDEO_SKIP_GAP = 900;    // 同一 video 元素最小间隔
@@ -1048,6 +1072,21 @@
   function mediaDur() {
     const v = currentVideo();
     return v && isFinite(v.duration) && v.duration > 0 ? v.duration : NaN;
+  }
+
+  // ---- v1.4.1：靠"和正片时长比"判断这个 media 到底是不是正片 ----
+  // 教训（现场）：那支广告自己是 3225 秒，用户看了 16 分钟。用"300 秒"这种绝对
+  // 分界线去猜，必然把长广告全判成正片，而且判错了还自我说服"多半是残留"。
+  // 真正可靠的参照是 mainDur（非广告态观察到的正片时长）：
+  //   mainClipLike(d) → 这就是正片，绝不能碰（把正片推到结尾是不可逆的）
+  //   notMainClip(d)  → 已证明不是正片（时长差得很远），多长都可以跳
+  // mainDur 还是 0（打开链接就先播广告）时两者都 false —— 没有参照就别动进度。
+  const MAIN_DUR_TOLERANCE = 2;   // 秒。正片时长有小数/取整差异，留 2s 余量
+  function mainClipLike(d) {
+    return mainDur > 0 && isFinite(d) && Math.abs(d - mainDur) <= MAIN_DUR_TOLERANCE;
+  }
+  function notMainClip(d) {
+    return mainDur > 0 && isFinite(d) && Math.abs(d - mainDur) > MAIN_DUR_TOLERANCE;
   }
 
   // 非广告态持续记录正片时长：广告里若出现"时长≈正片时长"的视频，
@@ -1204,29 +1243,34 @@
           : 'readyState=0（广告媒体未加载）');
         continue;
       }
-      if (!isFinite(dur) || dur <= 0 || dur > AD_MAX_DURATION) {
+      if (!isFinite(dur) || dur <= 0) {
         why = why || ('dur=' + dur);
-        // v1.3.8：现场那支 581.7 秒的"广告"让这条 why 每 5 秒重复一次，几百行
-        // 全是 dur=581.681，谁也看不出结论。这里一次性说清楚：它不是我们能跳的东西。
-        if (isFinite(dur) && dur > AD_MAX_DURATION && durTooLongLogged !== dur) {
+        continue;
+      }
+      // 时长与正片一致 → 这是正片，绝不碰（避免"跳到大结局"）
+      if (mainClipLike(dur)) {
+        why = why || '时长与正片一致';
+        dlogReject('maindur', '⏩ 时长与正片一致（', Math.round(dur * 10) / 10, 's），判定为正片，不动进度');
+        continue;
+      }
+      // v1.4.1：长度不再是硬门槛。**已证明不是正片**（时长 ≠ mainDur）就照跳 ——
+      // 现场那支广告本身就是 3225 秒，旧规则一句"这个量级更像正片"把它拒了，
+      // 结果用户看了 16 分钟广告，日志还把结论写成"多半是 ad-showing 残留"。
+      // 只有 mainDur 未知（打开链接先播广告）时才保守放弃：那时没有任何参照，
+      // 推错的代价是把正片推到大结局，不可逆——宁可漏跳这一支。
+      if (dur > AD_MAX_DURATION && !notMainClip(dur)) {
+        why = why || ('dur=' + dur);
+        if (durTooLongLogged !== dur) {
           durTooLongLogged = dur;
-          // 顺手记一下"到底有没有广告覆盖层"：有 → 是真的长广告；没有 → `ad-showing`
-          // 是残留的类名，我们盯了半天其实在盯正片。这两种情况的处理完全不同，
-          // 但上一版日志里都只显示 dur=581.681，看不出是哪一种。
+          // 顺手记一下"到底有没有广告覆盖层"：现场排查时这两个信号要分开看
           const hasOverlay = AD_OVERLAY_SELECTORS.some((sel) => {
             const el = document.querySelector(sel);
             return el && isVisible(el);
           });
-          dlog('🚫 广告态但媒体时长', Math.round(dur * 10) / 10, 's（>', AD_MAX_DURATION,
-            's），不参与强跳：这个量级更像正片或超长广告，推它等于把内容跳到大结局',
-            '| 广告覆盖层=', hasOverlay, hasOverlay ? '（真广告）' : '（多半是 ad-showing 残留）');
+          dlog('🚫 广告态但媒体时长', Math.round(dur * 10) / 10, 's，且没有正片时长作参照'
+            , '（mainDur=', Math.round(mainDur * 10) / 10, '），不参与强跳：推错就是把正片推到大结局，不可逆',
+            '| 广告覆盖层=', hasOverlay, hasOverlay ? '（覆盖层在，更像真广告，但仍无参照）' : '（也没有覆盖层）');
         }
-        continue;
-      }
-      // 时长与正片一致 → 这是正片，绝不碰（避免"跳到大结局"）
-      if (mainDur && Math.abs(dur - mainDur) <= 1) {
-        why = why || '时长与正片一致';
-        dlogReject('maindur', '⏩ 时长与正片一致（', Math.round(dur * 10) / 10, 's），判定为正片，不动进度');
         continue;
       }
       // v1.3.3：能证明"这个 video 不是正片"（时长与 mainDur 明显不同）时立刻动手，
@@ -1326,6 +1370,12 @@
         v.currentTime = jumpTarget;
         adJumpCount += 1;
         markAdAction(now);
+        // v1.4.1：长广告动手了就留痕。这一行是"300s 判正片"被推翻的直接证据，
+        // 下次再看日志，一眼能分清"跳了长广告"和"没敢跳"。
+        if (dur > AD_MAX_DURATION) {
+          dlog('⏩ 长广告强跳：duration=', Math.round(dur * 10) / 10, 's ≠ 正片',
+            Math.round(mainDur * 10) / 10, 's，判定为广告（长度不再是拒绝理由）');
+        }
         dlog('⏩ 视频层强跳：duration=', Math.round(dur * 10) / 10,
           '→ currentTime=', Math.round(v.currentTime * 10) / 10,
           early ? '（起播期 ct=' + (Math.round(ct * 10) / 10) + '，第 ' + earlySeeks + ' 次尝试）' : '');
@@ -1593,7 +1643,9 @@
     // 残留态 strong 也可能是 true（覆盖层 / 空壳按钮可见），按 3s 打就是纯噪音 ——
     // 上一版现场 286 行日志里绝大多数都是这种重复心跳。
     const dNow = mediaDur();
-    const canAct = strong && (hitCount > 0 || (isFinite(dNow) && dNow <= AD_MAX_DURATION));
+    // v1.4.1：长广告也算"会动手"（现在长度不再是拒绝理由），否则 16 分钟里
+    // 全是 15s 一行的稀疏心跳，反而看不出它还在盯。
+    const canAct = strong && (hitCount > 0 || !mainClipLike(dNow));
     const interval = Math.max(minGap || 0, canAct ? 3000 : 15000);
     if (sig !== lastBeatSig || now - lastDebugBeat > interval) {
       lastBeatSig = sig;
@@ -1650,9 +1702,14 @@
     // v1.3.9 把它收成只看 .ad-showing 之后，覆盖层可见却没挂类名的广告整段不动手。
     const winSig = adWindowSignal();
     if (residualQuietUntil) {
-      // 静默解除：广告 UI 消失（残留没了）或 媒体时长变回广告量级（真广告来了）
+      // 静默解除：广告 UI 消失（残留没了），或 现在这段 media 看起来确实是广告
+      // （短广告，或已证明 ≠ 正片的长广告）。
+      // v1.4.1：不能用"不等于正片"当条件——mainDur 未知时它恒为真，静默会被
+      // 立刻解除，于是每 8 秒重进一次广告态、点击预算被反复重置（测试 AB 现场：
+      // 20 秒点了 7 次、熔断日志都没了）。
       const d = mediaDur();
-      if (!winSig || (isFinite(d) && d <= AD_MAX_DURATION)) residualQuietUntil = 0;
+      const adLike = !isFinite(d) || d <= AD_MAX_DURATION || notMainClip(d);
+      if (!winSig || adLike) residualQuietUntil = 0;
     }
     if (winSig && !residualQuietUntil) {
       if (!adStateSince) {
@@ -1675,12 +1732,20 @@
         lastVskipWhy = '';                    // 新一次广告，诊断从第一行重新打
         dlog('📺 检测到广告开始（第', adEpoch, '次）');
       } else {
-        // v1.4.0 残留看门狗：窗口开着，可媒体时长一直是正片量级 —— forceSkip 反正也不会动
-        // （dur > AD_MAX_DURATION 那条直接拒绝），多半是 .ad-showing / 覆盖层的残留。
+        // v1.4.0 残留看门狗：窗口开着，可媒体一直是正片 —— forceSkip 反正也不会动
+        // （mainClipLike / 无参照 两条会拒），多半是 .ad-showing / 覆盖层的残留。
+        // v1.4.1：判据从"时长 > 300s"改成"这就是正片"。
+        //   a) mainDur 已知且 |d - mainDur| ≤ 容差 → 正片无疑，判残留
+        //   b) mainDur 未知但时长超广告量级 → 没有参照、反正也不会动手，别一直挂着
+        // 长广告（已证明 ≠ mainDur）不在此列：旧规则会把它当残留退出，于是
+        // "广告在播、我们却已经放弃"，比不退出更糟（现场 16 分钟就是这么来的）。
         const d = mediaDur();
-        if (isFinite(d) && d > AD_MAX_DURATION) {
+        const looksMain = mainClipLike(d) || (isFinite(d) && d > AD_MAX_DURATION && !(mainDur > 0));
+        if (looksMain) {
           if (!residualSince) residualSince = Date.now();
-          else if (Date.now() - residualSince >= AD_RESIDUAL_EXIT_MS) exitResidual('媒体时长属正片量级');
+          else if (Date.now() - residualSince >= AD_RESIDUAL_EXIT_MS) {
+            exitResidual(mainClipLike(d) ? '媒体时长与正片一致' : '时长超广告量级且无正片时长作参照');
+          }
         } else {
           residualSince = 0;
         }
