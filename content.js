@@ -56,6 +56,12 @@
  *  - [性能 P2] adStateStrong 增加"单 tick 内"缓存，同 tick 多次调用只算一次
  *  - [性能 P3] 文本兜底扫描（步骤 3）增加 2000ms 节流，避免每 tick 全量遍历
  *  - [性能 P4] visibleText 对不可见元素直接早退，省去 TreeWalker 全文遍历
+ *
+ * v1.2.8：修复 shadow root 内跳过按钮"能找到却点不到"
+ *  - scheduleClick 的存活判定 document.contains(el) → isAttached(el)：前者对
+ *    shadow root 内节点恒为 false，深度扫描（专为影子树按钮而写）命中后一律被丢弃
+ *  - isVisible 的祖先链跨 shadow 边界：宿主 display:none 时不再误判为可见
+ *  - 新增 closestDeep()：影子树内的节点也能正确判断是否在迷你播放器里
  */
 (() => {
   'use strict';
@@ -66,7 +72,7 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.2.7'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.2.8'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
@@ -248,11 +254,21 @@
     const self = getComputedStyle(el);
     if (self.display === 'none' || self.visibility === 'hidden' || self.opacity === '0') return false;
     // 任意祖先被隐藏，则整体不可见（opacity:0 的祖先同样让子树看不出来）
-    let p = el.parentElement;
-    while (p) {
+    // v1.2.8：祖先链跨 shadow 边界继续（宿主的 display:none 会隐藏整棵影子树，
+    // 而 parentElement 到 shadow root 就断了，会漏判成"可见"）。
+    let node = el;
+    let depth = 0;
+    while (node && depth++ < 40) {
+      let p = node.parentElement;
+      if (!p) {
+        let root = null;
+        try { root = node.getRootNode ? node.getRootNode() : null; } catch (_) { root = null; }
+        p = root && root.host ? root.host : null;   // 跳出 shadow 边界
+        if (!p) break;
+      }
       const ps = getComputedStyle(p);
       if (ps.display === 'none' || ps.visibility === 'hidden' || ps.opacity === '0') return false;
-      p = p.parentElement;
+      node = p;
     }
     const rect = el.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
@@ -479,7 +495,7 @@
     dlog('✅ 准备点击:', label || classOf(el).slice(0, 60) || el.tagName);
     setTimeout(() => {
       pendingSet.delete(el);
-      if (destroyed || !enabled || isCoolingDown(el) || !document.contains(el)) return;
+      if (destroyed || !enabled || isCoolingDown(el) || !isAttached(el)) return;
       // [S1] TOCTOU 复检：点击延迟 300–900ms 期间，元素可能被复用、被挪进广告
       // 链接（<a>/[role=link]），或广告已结束。点击前重新确认它仍然安全；
       // 跳过按钮还要求仍在强广告态（requireAd），否则点一个已失效/被复用的节点
@@ -732,8 +748,36 @@
 
   // 是否位于迷你播放器内——迷你播放器常有隐藏/离屏的跳过按钮副本，
   // 盲点它等于没点，肉眼可见的按钮在另一个播放器实例里。
+  // 跨 shadow 边界的 closest：closest() 到 shadow root 就停，
+  // 影子树内的节点向上找容器（迷你播放器、广告创意区）会漏判。
+  function closestDeep(el, sel, maxDepth) {
+    const limit = maxDepth || 20;
+    let node = el;
+    let depth = 0;
+    while (node && depth++ < limit) {
+      if (node.closest) {
+        let hit = null;
+        try { hit = node.closest(sel); } catch (_) { hit = null; }
+        if (hit) return hit;
+      }
+      let root = null;
+      try { root = node.getRootNode ? node.getRootNode() : null; } catch (_) { root = null; }
+      node = (root && root.host) ? root.host : null;
+    }
+    return null;
+  }
+
+  // 是否仍在文档中。v1.2.8：document.contains() 对 shadow root 内的节点恒为 false，
+  // 会把影子树里的跳过按钮一律判为"已脱离 DOM"而放弃点击——深度扫描专门为
+  // shadow 按钮存在，等于白跑。isConnected 是 shadow-including 判定，语义正确。
+  function isAttached(el) {
+    if (!el) return false;
+    if (typeof el.isConnected === 'boolean') return el.isConnected;
+    return document.contains(el);
+  }
+
   function inMiniPlayer(el) {
-    return !!(el.closest && el.closest('#mini-player, .ytp-miniplayer-ui'));
+    return !!(el && closestDeep(el, '#mini-player, .ytp-miniplayer-ui'));
   }
 
   // 深度遍历（穿透 open Shadow DOM）收集 root 子树里的所有元素。

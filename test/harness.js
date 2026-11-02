@@ -48,7 +48,7 @@ function makeChrome(init) {
     },
   });
   return {
-    runtime: { id: 'test-ext', lastError: undefined, getManifest: () => ({ version: '1.2.7' }) },
+    runtime: { id: 'test-ext', lastError: undefined, getManifest: () => ({ version: '1.2.8' }) },
     storage: {
       sync: area(sync, 'sync'),
       local: area(local, 'local'),
@@ -217,6 +217,67 @@ function check(name, pass, detail) {
     await sleep(1500);
     const t = win.document.querySelector('video').__getTime();
     check('G overlay 信号无 ad-showing 不误跳正片（S2）', Math.abs(t - 120) < 0.01, `currentTime=${t}`);
+  }
+
+  // ---------- H: shadow 内的跳过按钮应当被真实点击（v1.2.8 修复）----------
+  // 深度扫描本来就是为"按钮藏在 shadow root 里"而加的，但点击前的存活判定用
+  // document.contains(el) —— 对 shadow 内节点恒为 false，于是"找到了却被丢弃"。
+  // v1.2.8 改用 isConnected 后，这条路径才真正走通。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing">
+        <div id="safe-host"></div>
+      </div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 15, currentTime: 0.5, paused: false });
+    const { win } = await loadPage(html, { video });
+    const host = win.document.getElementById('safe-host');
+    const shadow = host.attachShadow({ mode: 'open' });
+    const btn = win.document.createElement('button');
+    btn.className = 'ytp-skip-ad-button';
+    btn.setAttribute('aria-label', '跳过广告');
+    btn.textContent = '跳过广告';
+    let clicks = 0;
+    btn.addEventListener('click', () => { clicks += 1; });
+    shadow.appendChild(btn);
+    await sleep(3500);   // 深扫节流 2000ms + 点击延迟 300~900ms
+    check('H shadow 内跳过按钮被真实点击', clicks > 0, `clicks=${clicks}`);
+  }
+
+  // ---------- I: 宿主被隐藏 -> shadow 内按钮不可见，不得点击（跨边界可见性）----------
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing">
+        <div id="hidden-host" style="display:none"></div>
+      </div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 15, currentTime: 0.5, paused: false });
+    const { win } = await loadPage(html, { video });
+    const host = win.document.getElementById('hidden-host');
+    const shadow = host.attachShadow({ mode: 'open' });
+    const btn = win.document.createElement('button');
+    btn.className = 'ytp-skip-ad-button';
+    btn.setAttribute('aria-label', '跳过广告');
+    let clicks = 0;
+    btn.addEventListener('click', () => { clicks += 1; });
+    shadow.appendChild(btn);
+    await sleep(3500);
+    check('I 宿主 display:none 时 shadow 内按钮不点击', clicks === 0, `clicks=${clicks}`);
+  }
+
+  // ---------- J: shadow 宿主是广告创意区 -> 仍不得点击（防落地页）----------
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing">
+        <div id="creative-host" class="ytp-ad-clickable"></div>
+      </div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 15, currentTime: 0.5, paused: false });
+    const { win } = await loadPage(html, { video });
+    const host = win.document.getElementById('creative-host');
+    const shadow = host.attachShadow({ mode: 'open' });
+    const btn = win.document.createElement('button');
+    btn.className = 'ytp-skip-ad-button';
+    btn.setAttribute('aria-label', '跳过广告');
+    let clicks = 0;
+    btn.addEventListener('click', () => { clicks += 1; });
+    shadow.appendChild(btn);
+    await sleep(3500);
+    check('J shadow 宿主为广告创意区时仍不点击', clicks === 0, `clicks=${clicks}`);
   }
 
   const failed = results.filter((r) => !r.pass);
