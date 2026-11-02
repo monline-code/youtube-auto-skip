@@ -49,7 +49,7 @@ function makeChrome(init) {
     },
   });
   return {
-    runtime: { id: 'test-ext', lastError: undefined, getManifest: () => ({ version: '1.2.9' }) },
+    runtime: { id: 'test-ext', lastError: undefined, getManifest: () => ({ version: '1.3.0' }) },
     storage: {
       sync: area(sync, 'sync'),
       local: area(local, 'local'),
@@ -85,16 +85,20 @@ function makeVideo(win, opts) {
   return v;
 }
 
-async function loadPage(html, { video, enabled = true, debug = false, stub } = {}) {
+async function loadPage(html, { video, enabled = true, debug = false, stub, zeroRect } = {}) {
   const dom = new JSDOM(`<!DOCTYPE html><body>${html}</body>`, {
     runScripts: 'outside-only',
     pretendToBeVisual: true,
   });
   const win = dom.window;
-  // jsdom 的 getBoundingClientRect 恒为 0，会让 isVisible 全部判为不可见
-  win.Element.prototype.getBoundingClientRect = () => ({
-    width: 100, height: 30, left: 10, top: 10, right: 110, bottom: 40, x: 10, y: 10,
-  });
+  // jsdom 的 getBoundingClientRect 恒为 0，会让 isVisible 全部判为不可见。
+  // zeroRect 指定的元素仍返回 0×0，用来复现"用户看得见、但测量为 0"的按钮（真实日志场景）。
+  win.Element.prototype.getBoundingClientRect = function () {
+    if (zeroRect && this.matches && this.matches(zeroRect)) {
+      return { width: 0, height: 0, left: 0, top: 0, right: 0, bottom: 0, x: 0, y: 0 };
+    }
+    return { width: 100, height: 30, left: 10, top: 10, right: 110, bottom: 40, x: 10, y: 10 };
+  };
   const player = win.document.querySelector('#movie_player');
   if (video && player) player.appendChild(video);
   win.chrome = makeChrome({ enabled, debug });
@@ -302,10 +306,42 @@ function check(name, pass, detail) {
     });
     let clicks = 0;
     win.document.querySelector('#kb').addEventListener('click', () => { clicks += 1; });
-    await sleep(100);                      // 首次 tick 已把点击排入队列（300ms 后执行）
+    // 点击延迟已缩到 150–400ms（Math.random=0 -> 150ms），loadPage 内部等 60ms，
+    // 首次 tick 已排入点击但尚未执行，此刻撤掉广告态才能落在延迟窗口内。
     player.className = 'html5-video-player';   // 广告结束：按钮仍在、依旧可见
     await sleep(700);
     check('K 延迟点击期间广告已结束则不点击', clicks === 0, `clicks=${clicks}`);
+  }
+
+  // ---------- L: 按钮 CSS 可见但 0×0 -> 仍应点击（真实日志场景）----------
+  // 2026-11 的 YouTube 日志：`.ytp-skip-ad-button` 的 text="跳过"、rect=0x0，
+  // 用户肉眼可见，扩展却因为尺寸为 0 一直拒绝，表现为"看到按钮但不点/点得晚"。
+  // v1.3.0 对跳过语义的元素放宽：CSS 未隐藏即可点，点击走 el.click()。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing">
+        <button id="zb" class="ytp-skip-ad-button">跳过</button>
+      </div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 15, currentTime: 0.5, paused: true });
+    const { win } = await loadPage(html, { video, zeroRect: '#zb' });
+    let clicks = 0;
+    let firstAt = 0;
+    const t0 = Date.now();
+    win.document.querySelector('#zb').addEventListener('click', () => { clicks += 1; if (!firstAt) firstAt = Date.now() - t0; });
+    await sleep(900);
+    check('L 0×0 但可见的跳过按钮被点击', clicks > 0, `clicks=${clicks}, 首次点击 ${firstAt}ms`);
+  }
+
+  // ---------- N: 0×0 且 CSS 隐藏 -> 不得点击（放宽不能变成无脑点）----------
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing">
+        <button id="hb" class="ytp-skip-ad-button" style="display:none">跳过</button>
+      </div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 15, currentTime: 0.5, paused: true });
+    const { win } = await loadPage(html, { video, zeroRect: '#hb' });
+    let clicks = 0;
+    win.document.querySelector('#hb').addEventListener('click', () => { clicks += 1; });
+    await sleep(900);
+    check('N 0×0 且 display:none 的按钮不点击', clicks === 0, `clicks=${clicks}`);
   }
 
   const failed = results.filter((r) => !r.pass);

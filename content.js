@@ -66,6 +66,15 @@
  * v1.2.9：S1 复检不再读过期缓存
  *  - adStateStrong(force)：延迟点击回调发生在两次 tick 之间，缓存里是上一次
  *    扫描的结论（广告已结束仍判为 true），TOCTOU 复检会形同虚设；复检处强制重算
+ *
+ * v1.3.0："看得见按钮却不点/点得晚"
+ *  - 放宽点击候选的可见性：YouTube 新版全屏布局里按钮 CSS 可见但
+ *    getBoundingClientRect() 为 0×0（实测日志 rect=0x0、text="跳过"），
+ *    原先严格按尺寸判定会一直等到布局稳定，表现就是点击滞后。
+ *    现在对"跳过语义"元素只要求 CSS 未隐藏，点击走 el.click()（不派发坐标事件）；
+ *    语义以文案/aria-label 为准，避免 0×0 空壳（无文本、点了没用）挤掉真按钮
+ *  - pickBest 平局规则：同等语义下优先有尺寸的目标，避免点到 0×0 空壳
+ *  - 点击前随机延迟 300–900ms → 150–400ms（仅为避开同帧竞态）
  */
 (() => {
   'use strict';
@@ -76,14 +85,14 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.2.9'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.3.0'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
   // ---------------- 配置 ----------------
   const CHECK_INTERVAL_MS = 600;      // 兜底轮询间隔
-  const CLICK_DELAY_MIN = 300;        // 点击前随机延迟，模拟人工
-  const CLICK_DELAY_MAX = 900;
+  const CLICK_DELAY_MIN = 150;        // 点击前随机延迟（仅为避开同帧竞态，不再做长延迟）
+  const CLICK_DELAY_MAX = 400;
   const RECLICK_COOLDOWN = 3500;      // 同一元素重复点击冷却
   // MutationObserver 事件合并后的最小 tick 间隔（上限 5 次/秒）。
   // 没有这层节流时，YouTube 播放期间的 DOM 抖动会让 tick 每秒跑十几次，
@@ -152,6 +161,7 @@
   // 每个 tick 开头清空（tick 内部不修改 DOM，缓存不会失真）。
   let visCache = new Map();
   let textCache = new Map();
+  let targetVisCache = new Map();     // [v1.3.0] 点击候选可用性缓存（含 0×0 放宽）
 
   // ---------------- 扩展上下文保护 ----------------
   // 扩展被刷新/卸载/重载后，旧内容脚本仍在页面里运行，
@@ -254,15 +264,46 @@
     return result;
   }
 
+  // 是否"跳过语义"的元素。判定以「文案/aria-label 是跳过」为准：
+  // 仅凭 class 含 skip+button 会把 YouTube 为兼容保留的 0×0 空壳也算进来，
+  // 那种空壳点了没用，还会在选择器顺序上挤掉真正的按钮（v1.2.3 的教训）。
+  function hasSkipSemantics(el) {
+    if (!el || !el.tagName) return false;
+    const t = elementText(el);
+    if (!t || t.length > 40) return false;
+    return SKIP_TEXT_RE.test(t) && !BAD_TEXT_RE.test(t);
+  }
+
+  // 点击候选的"可用"判定。
+  // v1.3.0：YouTube 新版全屏布局里存在「用户看得见、但按钮自身 getBoundingClientRect()
+  // 返回 0×0」的跳过按钮（视觉由父级/网格绘制，实测日志里 rect=0x0、text="跳过"）。
+  // 严格按尺寸判定会让点击一直等布局，体感就是"看到按钮却迟迟不点"。
+  // 因此对跳过语义的元素放宽：CSS 没被隐藏就算可用，点击走 el.click()（不派发坐标事件）。
+  function isTargetVisible(el) {
+    const cached = targetVisCache.get(el);
+    if (cached !== undefined) return cached;
+    let result = isVisible(el);
+    if (!result && hasSkipSemantics(el) && !isCssHidden(el)) result = true;
+    targetVisCache.set(el, result);
+    return result;
+  }
+
   function computeVisible(el) {
-    const self = getComputedStyle(el);
-    if (self.display === 'none' || self.visibility === 'hidden' || self.opacity === '0') return false;
-    // 任意祖先被隐藏，则整体不可见（opacity:0 的祖先同样让子树看不出来）
-    // v1.2.8：祖先链跨 shadow 边界继续（宿主的 display:none 会隐藏整棵影子树，
-    // 而 parentElement 到 shadow root 就断了，会漏判成"可见"）。
+    if (isCssHidden(el)) return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  // 只看 CSS 是否隐藏（display/visibility/opacity，含祖先，跨 shadow 边界），不看尺寸。
+  // v1.2.8：祖先链跨 shadow 边界继续（宿主的 display:none 会隐藏整棵影子树，
+  // 而 parentElement 到 shadow root 就断了，会漏判成"可见"）。
+  function isCssHidden(el) {
     let node = el;
     let depth = 0;
     while (node && depth++ < 40) {
+      let st = null;
+      try { st = getComputedStyle(node); } catch (_) { st = null; }
+      if (st && (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0')) return true;
       let p = node.parentElement;
       if (!p) {
         let root = null;
@@ -270,12 +311,9 @@
         p = root && root.host ? root.host : null;   // 跳出 shadow 边界
         if (!p) break;
       }
-      const ps = getComputedStyle(p);
-      if (ps.display === 'none' || ps.visibility === 'hidden' || ps.opacity === '0') return false;
       node = p;
     }
-    const rect = el.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
+    return false;
   }
 
   // 元素"可直接点击"的程度：2 = 真正的按钮语义，1 = 播放器按钮类，0 = 普通容器
@@ -357,11 +395,20 @@
       if (rank < 1) continue;
       if (c.matches && c.matches(EXCLUDE_SELECTOR)) continue;
       if (!isSafeClickTarget(c)) continue;
-      if (!isVisible(c)) continue;
+      if (!isTargetVisible(c)) continue;
       if (inCountdown(c)) continue;
       const r = c.getBoundingClientRect();
       const area = r.width * r.height;
-      if (rank > bestRank || (rank === bestRank && area < bestArea)) {
+      // 同分时：优先有尺寸的（0×0 只是放宽可点，有真实布局的目标更可能是真按钮），
+      // 都有尺寸再取面积更小的（更精确，避免点到整块容器）
+      let better = false;
+      if (rank > bestRank) better = true;
+      else if (rank === bestRank) {
+        if (bestArea > 0 && area === 0) better = false;
+        else if (bestArea === 0 && area > 0) better = true;
+        else better = area < bestArea;
+      }
+      if (better) {
         best = c;
         bestRank = rank;
         bestArea = area;
@@ -1008,6 +1055,7 @@
     // 避免跨 tick 用过期的缓存（见 adStateStrong 注释）。
     visCache.clear();
     textCache.clear();
+    targetVisCache.clear();
     adStateCache = undefined;
 
     // 强广告态跟踪：进入时记时间 + epoch+1，退出时清零
