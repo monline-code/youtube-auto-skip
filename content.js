@@ -142,6 +142,23 @@
  *    seekFails 顶到 2 误开 16× 加速；宽容用完回到原来的等待逻辑
  *  - [保留] 800ms 确认窗口不动。它不是"反应慢"，是"打开链接先播广告"时
  *    mainDur 未知、唯一能防"把正片推到大结局"的东西
+ *
+ * v1.3.8：起播期 seek 上线有效，但暴露了"广告态卡住时疯狂重试"的问题
+ *  - [数据] 第一支广告 5303ms 结束、首次动手 1492ms、起播期 ct=0 也跳掉了 ——
+ *    v1.3.7 的改动在现场是有效的
+ *  - [事故] 第二支之后 `.ad-showing` 一直没摘：一支 581.7 秒的"广告"播了 589 秒，
+ *    期间我们每 4.2 秒点一次那个"看得见但点了没用"的跳过按钮，一共 140 次，
+ *    全都没生效；同一句 `dur=581.681` 每 5 秒一行，把 500 行日志缓冲刷满，
+ *    连"广告开始""媒体就绪"都被挤掉了 —— 贴过来的日志只剩一片重复
+ *  - [改动] 点击预算 CLICK_BUDGET=4：同一支广告最多点 4 次，之后打一条
+ *    "停止重试"就收手（按钮点了没用，继续点只有 CPU 和日志两种成本）
+ *  - [改动] 时长超过 AD_MAX_DURATION 时只解释一次，并带上"广告覆盖层在不在"：
+ *    有 → 真长广告；没有 → ad-showing 残留，我们其实在盯正片
+ *  - [改动] 心跳不再被"DOM 里有按钮"完全压掉（有按钮时 15s 一次）。事故里
+ *    十分钟没有一条状态行，只能从点击日志反推
+ *  - [改动] "未动进度"同一原因改指数退避（5→10→20→40→60s）
+ *  - [修正] 计数虚高：以前"期间动过手"就 +1，于是那支播到底的广告也被记成
+ *    "自动跳过 1 次"。现在要求动作发生在广告结束前 5s 内
  */
 (() => {
   'use strict';
@@ -152,7 +169,7 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.3.7'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.3.8'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
@@ -323,11 +340,21 @@
   // v1.3.5："未动进度"专用节流：原因变了立即打印，否则 5s 一条。
   // 现场日志里 readyState=0 持续了 16 秒，旧实现每 3s 打一条一模一样的，
   // 看不出中间有没有变化；按"原因变化"打印才是时间线。
+  // v1.3.8：同一条原因用指数退避（5s → 10s → 20s → 40s → 60s 封顶）。
+  // 现场那支 589 秒的广告让同一句 dur=581.681 打了上百行，把 500 行缓冲刷满，
+  // 连"广告开始""媒体就绪"都被挤掉了——卡住不动的场景里，重复日志毫无信息量。
   let lastVskipWhy = '';
   let lastVskipAt = 0;
+  let vskipRepeat = 0;
   function logVskipWhy(why, now, extra) {
     if (!debug) return;
-    if (why === lastVskipWhy && now - lastVskipAt < 5000) return;
+    if (why === lastVskipWhy) {
+      const gap = Math.min(5000 * Math.pow(2, vskipRepeat), 60000);
+      if (now - lastVskipAt < gap) return;
+      vskipRepeat += 1;
+    } else {
+      vskipRepeat = 0;
+    }
     lastVskipWhy = why;
     lastVskipAt = now;
     dlog('⏩ 本 tick 未动进度：', why, extra);
@@ -717,6 +744,17 @@
 
   function scheduleClick(el, onDone, label, requireAd) {
     if (!el || isCoolingDown(el) || pendingSet.has(el)) return false;
+    // v1.3.8：点击预算熔断。现场那支 589 秒的广告里，我们点了 140 次同一个
+    // 按钮，一次都没生效——既费 CPU，又把 500 行日志缓冲刷满、把"广告开始"
+    // 那几行挤掉了。按钮点了没用就承认没用，停手等它自己结束或换支。
+    if (clickBudget <= 0) {
+      if (!clickBudgetWarned) {
+        clickBudgetWarned = true;
+        dlog('🛑 跳过按钮已点击', CLICK_BUDGET, '次仍无效，本支广告停止重试（等它自己结束/换支）');
+      }
+      return false;
+    }
+    clickBudget -= 1;
     pendingSet.add(el);
     // 只有真正调度了点击才打日志，避免"找到按钮"日志在冷却期内刷屏
     dlog('✅ 准备点击:', label || classOf(el).slice(0, 60) || el.tagName);
@@ -874,6 +912,17 @@
   const MEDIA_NUDGE_MAX = 3;            // 同一支广告最多催几次
   const MEDIA_NUDGE_GAP = 1200;         // 两次催流的最小间隔
 
+  // ---- v1.3.8：点击熔断与计数窗口 ----
+  // 现场事故（v1.3.7）：广告态持续了 589 秒，期间我们每 4.2 秒点一次那个
+  // "看得见但点了没用"的跳过按钮，一共点了 140 次，还把 500 行日志缓冲整个刷满，
+  // 连"广告开始"那几行都被挤掉了。按钮无效时继续点没有任何收益，必须熔断。
+  const CLICK_BUDGET = 4;               // 同一支广告最多点几次（用完后停手，等广告自己结束/换支）
+  const AD_END_COUNT_WINDOW = 5000;     // 结束前多久内动过手才算"我们跳掉的"（防计数虚高）
+  let clickBudget = CLICK_BUDGET;       // 剩余可点击次数（每次广告/换支重置）
+  let clickBudgetWarned = false;        // "熔断"那条日志只打一次
+  let adLastActionAt = 0;               // 本次广告内最后一次真的动手的时间
+  let durTooLongLogged = 0;             // 已经解释过"时长超过 AD_MAX_DURATION"的那个时长
+
   // 广告结束后把播放速度还原，别把正片也加速了
   function releaseRateBoost() {
     if (!rateBoostEl) return;
@@ -912,6 +961,10 @@
     nudgeTimes = new WeakMap();
     earlySeeks = 0;
     jumpProvisional = false;
+    // 换支了：新的一支重新给足点击预算（pod 里上一支点完 8 次不代表下一支不用点）
+    clickBudget = CLICK_BUDGET;
+    clickBudgetWarned = false;
+    durTooLongLogged = 0;
   }
 
   // ---- v1.3.5：广告耗时归因 ----
@@ -925,6 +978,7 @@
 
   function markAdAction(now) {
     if (!adFirstActionAt) adFirstActionAt = now;
+    adLastActionAt = now;   // v1.3.8：广告结束时用它判断"到底是不是我们跳掉的"
   }
 
   // 每 tick 采样一次：广告期间 video 处于 readyState<1 的时长累加进来。
@@ -1036,7 +1090,25 @@
           : 'readyState=0（广告媒体未加载）');
         continue;
       }
-      if (!isFinite(dur) || dur <= 0 || dur > AD_MAX_DURATION) { why = why || ('dur=' + dur); continue; }
+      if (!isFinite(dur) || dur <= 0 || dur > AD_MAX_DURATION) {
+        why = why || ('dur=' + dur);
+        // v1.3.8：现场那支 581.7 秒的"广告"让这条 why 每 5 秒重复一次，几百行
+        // 全是 dur=581.681，谁也看不出结论。这里一次性说清楚：它不是我们能跳的东西。
+        if (isFinite(dur) && dur > AD_MAX_DURATION && durTooLongLogged !== dur) {
+          durTooLongLogged = dur;
+          // 顺手记一下"到底有没有广告覆盖层"：有 → 是真的长广告；没有 → `ad-showing`
+          // 是残留的类名，我们盯了半天其实在盯正片。这两种情况的处理完全不同，
+          // 但上一版日志里都只显示 dur=581.681，看不出是哪一种。
+          const hasOverlay = AD_OVERLAY_SELECTORS.some((sel) => {
+            const el = document.querySelector(sel);
+            return el && isVisible(el);
+          });
+          dlog('🚫 广告态但媒体时长', Math.round(dur * 10) / 10, 's（>', AD_MAX_DURATION,
+            's），不参与强跳：这个量级更像正片或超长广告，推它等于把内容跳到大结局',
+            '| 广告覆盖层=', hasOverlay, hasOverlay ? '（真广告）' : '（多半是 ad-showing 残留）');
+        }
+        continue;
+      }
       // 时长与正片一致 → 这是正片，绝不碰（避免"跳到大结局"）
       if (mainDur && Math.abs(dur - mainDur) <= 1) {
         why = why || '时长与正片一致';
@@ -1393,14 +1465,16 @@
   // 广告结束/空闲态（strong=false）每 15s 一次，仅可动手的广告态才 3s 一次。
   // 之前用宽松的 adPlaying 决定节奏：广告结束后 .ad-interrupting / 残留覆盖层
   // 仍让 adPlaying=true，导致按 3s 持续刷屏（实际并不会动作，纯噪音）。
-  function emitDebugBeat() {
+  // v1.3.8：minGap 用于"有跳过按钮时也要打心跳"的场景——那个分支以前完全不打，
+  // 于是现场那 10 分钟的卡死期里连一条状态行都没有，只能从点击日志反推。
+  function emitDebugBeat(minGap) {
     const adShowing = !!document.querySelector('.ad-showing');
     const adPlaying = isAdPlaying();
     const strong = adStateStrong();            // 是否真的会动播放器
     const hitCount = SKIP_SELECTORS.reduce((n, s) => n + queryAllSafe(s).length, 0);
     const sig = (strong ? 1 : 0) + '|' + (adPlaying ? 1 : 0) + '|' + (adShowing ? 1 : 0) + '|' + hitCount;
     const now = Date.now();
-    const interval = strong ? 3000 : 15000;
+    const interval = Math.max(minGap || 0, strong ? 3000 : 15000);
     if (sig !== lastBeatSig || now - lastDebugBeat > interval) {
       lastBeatSig = sig;
       lastDebugBeat = now;
@@ -1466,8 +1540,15 @@
           '| 媒体未就绪累计 ' + adMediaWaitMs + 'ms',
           adMediaWaitMs ? '（占 ' + Math.round(adMediaWaitMs / total * 100) + '%）' : '');
         lastVskipWhy = '';
-        // 只在"广告真的结束 + 期间我们动过手"时计数，避免点了无效也算一次
-        if (epochActed) { epochActed = false; bumpCount(); }
+        // v1.3.8：只在"广告真的结束 + 结束前不久我们动过手"时计数。
+        // 以前只判"期间动过手"，于是那支 589 秒的广告（点了 140 次全无效、
+        // 一路播到底）也被记成"自动跳过 1 次"，计数纯属虚高。
+        if (epochActed && adLastActionAt && Date.now() - adLastActionAt <= AD_END_COUNT_WINDOW) {
+          epochActed = false;
+          bumpCount();
+        } else {
+          epochActed = false;
+        }
       }
       recordMainDur();
     }
@@ -1495,9 +1576,10 @@
         lastCoolLog = Date.now();
         dlog('（跳过按钮已找到，处于冷却/排队中，暂不重复点击）');
       }
-    } else if (debug) {
-      emitDebugBeat();
     }
+    // v1.3.8：以前这里是 else if——只要有按钮在 DOM 里（哪怕是残留的空壳），
+    // 心跳就再也不打了。现在无论有没有按钮都打，只是有按钮时放慢到 15s。
+    if (debug) emitDebugBeat(skipBtn ? 15000 : 0);
 
     const closeBtn = findCloseButton();
     if (closeBtn) {

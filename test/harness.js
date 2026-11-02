@@ -617,6 +617,71 @@ function check(name, pass, detail) {
       `rate=${v.playbackRate}, 丢弃日志=${dropped}, 宽容用完=${capped}`);
   }
 
+  // ---------- AB: 点不动的按钮 -> 点满预算就熔断（v1.3.8）----------
+  // 现场事故：那支 589 秒的广告里我们每 4.2 秒点一次同一个按钮，共 140 次，
+  // 一次都没生效，还把 500 行日志缓冲刷满、把"广告开始"挤掉了。
+  // 时长设成 600s 是为了让"时长超上限"分支先挡住强跳，纯看点击这一路。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing">
+        <button id="sb" class="ytp-skip-ad-button">跳过</button>
+      </div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 600, currentTime: 1, paused: false });
+    const { logs } = await loadPage(html, { video, debug: true });
+    await sleep(20000);                      // 冷却 3.5s × 5 次 + 熔断那一条
+    const clicks = logs.filter((l) => l.indexOf('🖱️ 实际点击') >= 0).length;
+    const capped = logs.some((l) => l.indexOf('停止重试') >= 0);
+    check('AB 按钮点击无效时按预算熔断（不再无限重试）',
+      clicks > 0 && clicks <= 4 && capped, `实际点击=${clicks}, 熔断日志=${capped}`);
+  }
+
+  // ---------- AC: 广告态 + 媒体时长超过上限 -> 不推、只解释一次（v1.3.8）----------
+  // 现场那支 581.7 秒的"广告"让 dur=581.681 每 5 秒重复一行，几百行里看不出
+  // 结论。这里要求：不碰进度 + 只打一条说清"这不是能跳的东西"。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 581.7, currentTime: 0, paused: false });
+    const { win, logs } = await loadPage(html, { video, debug: true });
+    await sleep(4000);
+    const t = win.document.querySelector('video').__getTime();
+    const explain = logs.filter((l) => l.indexOf('不参与强跳') >= 0).length;
+    check('AC 时长超过上限的"广告"不推、只解释一次',
+      Math.abs(t) < 0.01 && explain === 1, `currentTime=${t.toFixed(2)}, 解释行=${explain}`);
+  }
+
+  // ---------- AD: 广告自己播完的，不算"我们跳掉的"（v1.3.8）----------
+  // 以前只判"期间动过手"，于是点了 140 次全无效、一路播到底的那支也被记成
+  // "自动跳过 1 次"。现在要求动作发生在上一次点击 5 秒内，才计数。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing">
+        <button id="sb" class="ytp-skip-ad-button">跳过</button>
+      </div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 600, currentTime: 1, paused: false });
+    const { win, player, chrome: ch } = await loadPage(html, { video });
+    // 点一次就让按钮消失：否则冷却一过又会点，最后一次动作永远离结束很近
+    const btn = win.document.querySelector('#sb');
+    btn.addEventListener('click', () => btn.remove(), { once: true });
+    await sleep(1500);                       // 已经点过（epochActed=true），按钮随即消失
+    await sleep(6000);                       // 之后广告还继续播了 6 秒
+    player.className = 'html5-video-player'; // 广告自己结束
+    await sleep(400);
+    check('AD 广告自己播完不虚增计数', (ch.__local.skipped || 0) === 0,
+      `skipped=${ch.__local.skipped}`);
+  }
+
+  // ---------- AE: 点完马上结束 -> 正常计数（AD 的对照，防一刀切）----------
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing">
+        <button id="sb" class="ytp-skip-ad-button">跳过</button>
+      </div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 600, currentTime: 1, paused: false });
+    const { player, chrome: ch } = await loadPage(html, { video });
+    await sleep(1200);                       // 点击发生
+    player.className = 'html5-video-player'; // 紧接着广告结束
+    await sleep(400);
+    check('AE 点完立即结束仍然计数', (ch.__local.skipped || 0) === 1,
+      `skipped=${ch.__local.skipped}`);
+  }
+
   const failed = results.filter((r) => !r.pass);
   console.log(`\n共 ${results.length} 项，通过 ${results.length - failed.length}，失败 ${failed.length}`);
   process.exit(failed.length ? 1 : 0);
