@@ -560,11 +560,13 @@ function check(name, pass, detail) {
     await sleep(1200);
     const resp = ch.__sendMessage({ type: 'ytAutoSkip:dumpLog' });
     const ver = require('../manifest.json').version;
+    const first = String((resp && resp.text) || '').split('\n')[0];
     const ok = !!resp && resp.count > 0 && resp.version === ver
       && /视频层强跳/.test(resp.text)
+      && first.indexOf('v' + ver) >= 0          // 首行是版本头（v1.3.7）
       && String(resp.text).split('\n').every((l) => l.indexOf('[YT-AutoSkip]') >= 0);
     check('X popup 可一键导出扩展日志（不含页面噪音）',
-      ok, resp ? `count=${resp.count}, version=${resp.version}` : '无响应');
+      ok, resp ? `count=${resp.count}, version=${resp.version}, 首行=${first.slice(0, 40)}` : '无响应');
   }
 
   // ---------- Y: 调试关闭时导出为空，且不误报"有日志" ----------

@@ -334,14 +334,24 @@
   }
 
   // v1.3.6：供 popup 导出日志。只回传本扩展自己的行，不带页面噪音。
+  // v1.3.7：首行补一条头信息（版本/时间/页内广告次数）。之前导出的文本里
+  // 没有版本号——"加载 vX 已加载"那行发生在读到调试开关之前，进不了缓冲，
+  // 于是每次贴日志都要靠猜是哪一版。
   if (chrome.runtime && chrome.runtime.onMessage) {
     chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       if (!msg || msg.type !== 'ytAutoSkip:dumpLog') return undefined;
+      const d = new Date();
+      const pad = (n) => String(n).padStart(2, '0');
+      const head = '[YT-AutoSkip] v' + VERSION
+        + ' | debug=' + (debug ? 'on' : 'off')
+        + ' | ' + d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate())
+        + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds())
+        + ' | 行数=' + logBuf.length;
       sendResponse({
         version: VERSION,
         debug: !!debug,
         count: logBuf.length,
-        text: logBuf.join('\n'),
+        text: logBuf.length ? head + '\n' + logBuf.join('\n') : '',
       });
       if (msg.clear) logBuf.length = 0;
       return true;
