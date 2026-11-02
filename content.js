@@ -111,6 +111,23 @@
  *    输出 readyState / duration / mainDur / 广告已持续时长
  *  - [修正] seek 校验里的 document.contains(jumpEl) 换成 isAttached()：
  *    前者对 shadow root 内节点恒为 false（v1.2.8 修过同类问题，这里漏了）
+ *
+ * v1.3.5：v1.3.4 的诊断日志把"1.9 秒之谜"结案了，也推翻了 v1.3.4 自己的假设
+ *  - [结论] 那 1.9 秒不是我们的开销：日志里广告开始后 200ms 就尝试强跳，但
+ *    readyState=0（广告媒体还没挂上），代码按设计只能等。真正花时间的是广告
+ *    自己的媒体加载 —— 我们第一次能动手时距广告开始 1785ms，其中我们的
+ *    反应只占 200ms
+ *  - [结论] v1.3.4 的"贴尾暂停救援"在实际日志里一次都没执行过：readyState<1
+ *    的判定排在它前面，而广告切流期间 video 全程 readyState=0。上一版修的
+ *    "paused 挡住重试"是真实缺陷，但不是那 9.2 秒的原因
+ *  - [诊断] 每条"未动进度"都带上 dur/ct/paused，并区分 readyState=0 的两种
+ *    含义（媒体未加载 / 已贴尾在切流）；只在原因变化或满 5s 时打印，
+ *    时间线一眼能读
+ *  - [诊断] 新增 🎬 广告媒体就绪 与 📊 广告结束 汇总：直接给出"检测→媒体就绪"
+ *    "检测→首次动手""媒体未就绪累计"三个数，下次不必再从行序里推
+ *  - [实验] 推完一支广告后若 video 长期停在 readyState=0，补一次 play() 触发
+ *    它的资源加载算法（上限 3 次、间隔 1.2s）。现场那 7~9 秒切流如果只是
+ *    "取流没被拉起"，这一下能省掉；日志会打出"催流 play()（第 N 次）"以便验证
  */
 (() => {
   'use strict';
@@ -121,7 +138,7 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.3.4'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.3.5'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
@@ -272,6 +289,19 @@
     if (rejectLogTimes[key] && now - rejectLogTimes[key] < 3000) return;
     rejectLogTimes[key] = now;
     dlog(...args);
+  }
+
+  // v1.3.5："未动进度"专用节流：原因变了立即打印，否则 5s 一条。
+  // 现场日志里 readyState=0 持续了 16 秒，旧实现每 3s 打一条一模一样的，
+  // 看不出中间有没有变化；按"原因变化"打印才是时间线。
+  let lastVskipWhy = '';
+  let lastVskipAt = 0;
+  function logVskipWhy(why, now, extra) {
+    if (!debug) return;
+    if (why === lastVskipWhy && now - lastVskipAt < 5000) return;
+    lastVskipWhy = why;
+    lastVskipAt = now;
+    dlog('⏩ 本 tick 未动进度：', why, extra);
   }
 
   function loadDebug() {
@@ -774,6 +804,19 @@
   let videoSkipTimes = new WeakMap();   // video -> 上次跳转时间（同样按广告重置）
   let lastJumpDur = 0;                  // 上一次强跳的视频时长，用于认出 pod 里的下一支
 
+  // ---- v1.3.5：广告耗时归因 ----
+  // 现场日志（v1.3.4）里"广告开始 → 广告结束"整整 18.2 秒，但里面只有 1.8 秒
+  // 是真的在播广告，其余全是 readyState=0 的等待。这三个量把等待拆开，
+  // 下次贴日志只要看 📊 那一行就知道时间到底花在我们身上还是播放器身上。
+  let adFirstActionAt = 0;    // 本次广告内第一次真的动手（跳/加速/催流）的时间
+  let adJumpCount = 0;        // 本次广告内成功强跳的次数（pod 会 >1）
+  let adMediaWaitMs = 0;      // 本次广告内 video 处于 readyState<1 的累计时长（估算）
+  let adMediaSampleAt = 0;    // 上面那个累计量的采样基准
+  let adMediaReadyDur = 0;    // 已经播报过"媒体就绪"的那支广告的时长（用于去重）
+  let nudgeTimes = new WeakMap();       // video -> { n, t } 催流记录（按广告重置）
+  const MEDIA_NUDGE_MAX = 3;            // 同一支广告最多催几次
+  const MEDIA_NUDGE_GAP = 1200;         // 两次催流的最小间隔
+
   // 广告结束后把播放速度还原，别把正片也加速了
   function releaseRateBoost() {
     if (!rateBoostEl) return;
@@ -809,6 +852,65 @@
     adScopedSeq += 1;                 // 让上一支的点击冷却整体失效（不必重建 WeakMap）
     pendingSet = new WeakSet();
     videoSkipTimes = new WeakMap();
+    nudgeTimes = new WeakMap();
+  }
+
+  // ---- v1.3.5：广告耗时归因 ----
+  function resetAdStats(now) {
+    adFirstActionAt = 0;
+    adJumpCount = 0;
+    adMediaWaitMs = 0;
+    adMediaSampleAt = now;
+    adMediaReadyDur = 0;
+  }
+
+  function markAdAction(now) {
+    if (!adFirstActionAt) adFirstActionAt = now;
+  }
+
+  // 每 tick 采样一次：广告期间 video 处于 readyState<1 的时长累加进来。
+  // 这一段是"我们什么都做不了"的时间（广告媒体没加载 / 播放器在切流），
+  // 和被 200ms 最小等待、冷却窗口挡掉的时间完全不是一回事，必须分开计时。
+  function sampleAdMedia(now) {
+    const v = currentVideo();
+    if (!v) { adMediaSampleAt = now; return; }
+    if (adMediaSampleAt && v.readyState < 1) adMediaWaitMs += now - adMediaSampleAt;
+    adMediaSampleAt = now;
+    if (v.readyState < 1) return;
+    const dur = v.duration;
+    if (!isFinite(dur) || dur <= 0) return;
+    const key = Math.round(dur * 10) / 10;
+    if (key === adMediaReadyDur) return;      // 同一支只报一次（pod 里时长变了会再报）
+    adMediaReadyDur = key;
+    dlog('🎬 广告媒体就绪：检测到广告后 +', now - (adStateSince || now), 'ms',
+      '| duration=', key, '| 累计等待媒体=', adMediaWaitMs, 'ms');
+  }
+
+  // 推完一支广告后 video 会长时间停在 readyState=0（现场 7~9 秒），此时 seek
+  // 一定无效，能做的只有把 media element 的资源加载算法重新拉起来。
+  // 对 readyState=0 的元素调 play() 正是触发它的方式，且不会改变播放位置。
+  // 限制：只对"我们刚推过结尾的那个元素"做、每支最多 3 次、间隔 1.2s，
+  // 免得在正常的缓冲抖动里反复打扰播放器。
+  function nudgeDetachedMedia(v, now) {
+    // 认元素而不是认时长：readyState=0 时 duration 往往已经是 NaN（媒体被摘），
+    // 按"时长等于上次强跳的那支"来判会永远不成立，这个实验就永远不会执行。
+    const ours = jumpEl === v;
+    if (!ours) return false;
+    const rec = nudgeTimes.get(v) || { n: 0, t: 0 };
+    if (rec.n >= MEDIA_NUDGE_MAX) return false;
+    if (now - rec.t < MEDIA_NUDGE_GAP) return false;
+    rec.n += 1;
+    rec.t = now;
+    nudgeTimes.set(v, rec);
+    // play() 在"没有可用媒体源"时会返回一个 rejected promise：
+    // 这是预期内的情况，必须自己吞掉，否则控制台会多出 Uncaught (in promise)。
+    try {
+      const p = v.play();
+      if (p && typeof p.catch === 'function') p.catch(() => { /* 预期内，忽略 */ });
+    } catch (_) { /* ignore */ }
+    markAdAction(now);
+    dlog('⏩ 媒体未就绪且已贴尾，催流 play()（第', rec.n, '次 / 上限', MEDIA_NUDGE_MAX, '）');
+    return true;
   }
 
   function forceSkipAdViaVideo() {
@@ -843,12 +945,29 @@
     const vids = player.querySelectorAll('video');
     let acted = false;
     let why = '';
+    let whyInfo = '';
 
     for (const v of vids) {
       if (!v) continue;
       const dur = v.duration;
       const ct = v.currentTime;
-      if (v.readyState < 1) { why = why || ('readyState=' + v.readyState); continue; }
+      if (!why) {
+        whyInfo = ' | dur=' + (Math.round(dur * 10) / 10)
+          + ' | ct=' + (Math.round(ct * 10) / 10)
+          + ' | paused=' + v.paused;
+      }
+      if (v.readyState < 1) {
+        // v1.3.5：readyState=0 有两种完全不同的含义，以前混成一条日志，
+        // 于是把"播放器在切流"误判成"我们没动手"。
+        //  - 媒体未加载：广告刚换上/刚被摘流，谁也动不了，只能等
+        //  - 已贴尾在切流：我们上一 tick 已经把它推到结尾，播放器正在换下一支
+        const torn = jumpDur > 0 && isFinite(dur) && Math.abs(dur - jumpDur) <= 1;
+        nudgeDetachedMedia(v, now);
+        why = why || (torn
+          ? 'readyState=0（上一支已贴尾，播放器在切流）'
+          : 'readyState=0（广告媒体未加载）');
+        continue;
+      }
       if (!isFinite(dur) || dur <= 0 || dur > AD_MAX_DURATION) { why = why || ('dur=' + dur); continue; }
       // 时长与正片一致 → 这是正片，绝不碰（避免"跳到大结局"）
       if (mainDur && Math.abs(dur - mainDur) <= 1) {
@@ -871,6 +990,9 @@
       // 网络或广告服务一慢就会长时间挂着（现场日志：跳完 27.8s 那支后，过了 9.2s
       // 才切到下一支，期间 tick 全被 "暂停中不动进度" 静默挡掉）。
       // 这里主动补一次 seek + play 把它推过去；用 videoSkipTimes 节流，别每 tick 骚扰。
+      // v1.3.5：注意这条分支只在 readyState>=1 时才会走到——广告切流期间 video
+      // 是 readyState=0，被上面那条挡掉了。所以现场那 9.2 秒从来不是它造成的，
+      // 保留它只为"媒体已就绪但播放器暂停"这种真实情况。
       if (v.paused) {
         if (!atEnd) { why = why || 'paused'; continue; }
         const t2 = videoSkipTimes.get(v);
@@ -880,6 +1002,7 @@
         try { v.currentTime = Math.max(0, dur - 0.05); } catch (_) { /* ignore */ }
         try { v.play(); } catch (_) { /* ignore */ }
         acted = true;
+        markAdAction(now);
         dlog('⏩ 广告贴尾但被暂停（多半在等切流），主动续播：duration=', Math.round(dur * 10) / 10,
           '| currentTime=', Math.round(ct * 10) / 10);
         continue;
@@ -933,6 +1056,8 @@
         jumpEl = v;
         jumpDur = dur;
         v.currentTime = jumpTarget;
+        adJumpCount += 1;
+        markAdAction(now);
         dlog('⏩ 视频层强跳：duration=', Math.round(dur * 10) / 10,
           '→ currentTime=', Math.round(v.currentTime * 10) / 10);
         epochActed = true;
@@ -941,13 +1066,15 @@
         dlog('⏩ 视频层强跳失败:', String(err && err.message));
       }
     }
-    // v1.3.4：没动手就把原因记下来（节流 3s），否则"广告播了 1.9 秒才跳"永远
-    // 说不清是 readyState、currentTime<0.3、确认窗口，还是 tick 根本没跑到。
-    if (!acted && debug && why) {
-      dlogReject('vskip', '⏩ 本 tick 未动进度：', why,
-        '| 候选 video=', vids.length,
-        '| 广告已持续=', now - adStateSince, 'ms',
-        '| mainDur=', mainDur);
+    // v1.3.4：没动手就把原因记下来，否则"广告播了 1.9 秒才跳"永远说不清是
+    // readyState、currentTime<0.3、确认窗口，还是 tick 根本没跑到。
+    // v1.3.5：只在"原因变了"或满 5s 时打印。之前在 readyState=0 的那 16 秒里
+    // 每 3s 重复同一条，时间线反而看不清；现在每换一个阶段恰好一行。
+    if (!acted && why) {
+      logVskipWhy(why, now, whyInfo
+        + ' | 候选 video=' + vids.length
+        + ' | 广告已持续=' + (now - adStateSince) + 'ms'
+        + ' | mainDur=' + mainDur);
     }
     return false;
   }
@@ -1231,10 +1358,13 @@
         // 白白挡几秒，用户看到的仍是"点了但慢半拍"。每次新广告开始都重置。
         resetAdScopedState();
         lastJumpDur = 0;
+        resetAdStats(adStateSince);
+        lastVskipWhy = '';                    // 新一次广告，诊断从第一行重新打
         dlog('📺 检测到广告开始（第', adEpoch, '次）');
       }
     } else {
       if (adStateSince) {
+        const adStartedAt = adStateSince;      // 汇总要用，先存下来
         adStateSince = 0;
         adEndGuardUntil = Date.now() + 1500;   // 广告结束后的保护窗口
         seekFails = 0;
@@ -1243,12 +1373,25 @@
         jumpDur = 0;
         endStallSince = 0;
         releaseRateBoost();                     // 把播放速度还原，别加速正片
-        dlog('📺 广告结束');
+        const total = Date.now() - adStartedAt;
+        // v1.3.5：一行交代"这次广告的时间去哪了"。现场日志里 18.2 秒只有 1.8 秒
+        // 在真的播广告，其余全是 readyState=0 的等待——但那是靠人工数出来的，
+        // 现在直接打印，下次判断"该不该继续优化"不用再猜。
+        dlog('📊 广告结束：总', total, 'ms',
+          '| 首次动手', adFirstActionAt ? (adFirstActionAt - adStartedAt) + 'ms' : '（全程未动手）',
+          '| 强跳', adJumpCount, '次',
+          '| 媒体未就绪累计 ' + adMediaWaitMs + 'ms',
+          adMediaWaitMs ? '（占 ' + Math.round(adMediaWaitMs / total * 100) + '%）' : '');
+        lastVskipWhy = '';
         // 只在"广告真的结束 + 期间我们动过手"时计数，避免点了无效也算一次
         if (epochActed) { epochActed = false; bumpCount(); }
       }
       recordMainDur();
     }
+
+    // v1.3.5：广告期间每 tick 采一次样，累计"媒体没就绪"的时长，
+    // 并在媒体刚就绪时补一条 🎬，把"我们的反应"和"广告自己的加载"分开计时。
+    if (adStateSince) sampleAdMedia(Date.now());
 
     // 【主力】广告一开始就把广告视频推到结尾。
     // v1.3.3：外层只挡"广告标记刚挂上的那一两帧"，细粒度确认窗口挪进
@@ -1264,7 +1407,7 @@
     if (skipBtn) {
       // 跳过按钮是"强广告态下"找到的，延迟期间广告可能已结束/元素被复用，
       // 因此 requireAd=true：点击前要求仍在强广告态（见 scheduleClick 的 S1 复检）。
-      const scheduled = scheduleClick(skipBtn, () => { epochActed = true; }, null, true);
+      const scheduled = scheduleClick(skipBtn, () => { epochActed = true; markAdAction(Date.now()); }, null, true);
       if (!scheduled && debug && Date.now() - lastCoolLog > 6000) {
         lastCoolLog = Date.now();
         dlog('（跳过按钮已找到，处于冷却/排队中，暂不重复点击）');

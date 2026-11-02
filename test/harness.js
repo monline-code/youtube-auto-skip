@@ -75,7 +75,11 @@ function makeVideo(win, opts) {
     configurable: true,
   });
   Object.defineProperty(v, 'paused', { get: () => !!opts.paused, configurable: true });
-  Object.defineProperty(v, 'readyState', { get: () => 4, configurable: true });
+  // readyState 可变：v1.3.5 的用例要复现"广告媒体没挂上 / 推完被摘流"的 readyState=0
+  Object.defineProperty(v, 'readyState', {
+    get: () => (opts.readyState === undefined ? 4 : opts.readyState),
+    configurable: true,
+  });
   Object.defineProperty(v, 'playbackRate', {
     get: () => rate,
     set: (val) => { rate = val; },
@@ -471,6 +475,67 @@ function check(name, pass, detail) {
     await sleep(1400);
     const t = win.document.querySelector('video').__getTime();
     check('T 广告贴尾且暂停时主动续播', plays > 0, `play() ${plays} 次, currentTime=${t.toFixed(2)}`);
+  }
+
+  // ---------- U: 推完结尾后 video 停在 readyState=0 -> 催流（现场 7~9 秒切流）----------
+  // 2026-11-02 日志：每推完一支广告，<video> 就在 readyState=0 上挂 7~9 秒，
+  // 期间 .ad-showing 还在、画面停在最后一帧，seek 一定无效。能做的只有把
+  // media element 的资源加载算法重新拉起来 —— 对 readyState=0 的元素调 play()。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const opts = { duration: 15, currentTime: 0.5, paused: false };
+    const video = makeVideo(new JSDOM('').window, opts);
+    let plays = 0;
+    video.play = () => { plays += 1; return Promise.resolve(); };
+    const { win, logs } = await loadPage(html, { video, debug: true });
+    await sleep(1200);                       // 此时已强跳到 14.95
+    const jumped = win.document.querySelector('video').__getTime();
+    const playsBefore = plays;
+    opts.readyState = 0;                     // 播放器把媒体摘了（切流）
+    await sleep(1600);
+    const nudged = logs.filter((l) => l.indexOf('催流') >= 0).length;
+    check('U 推完结尾后 readyState=0 会催流 play()',
+      jumped > 14 && playsBefore === 0 && plays > 0 && plays <= 3 && nudged > 0,
+      `跳后 currentTime=${jumped.toFixed(2)}, play() 前=${playsBefore} 后=${plays}, 催流日志=${nudged}`);
+  }
+
+  // ---------- V: 没推过的广告在 readyState=0 时不得 play()、不得 seek ----------
+  // 边界：媒体压根没加载时 play() 也可能被调用去拉流，但那属于"广告还没开始播"，
+  // 不是我们该插手的地方；此处的催流只针对"我们自己把它推到了结尾"的那种 0。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const opts = { duration: 15, currentTime: 0.5, paused: false, readyState: 0 };
+    const video = makeVideo(new JSDOM('').window, opts);
+    let plays = 0;
+    video.play = () => { plays += 1; return Promise.resolve(); };
+    const { win, logs } = await loadPage(html, { video, debug: true });
+    await sleep(1600);
+    const t = win.document.querySelector('video').__getTime();
+    const reason = logs.some((l) => l.indexOf('readyState=0（广告媒体未加载）') >= 0);
+    check('V 媒体未加载时不催流、不 seek，并说清原因',
+      plays === 0 && Math.abs(t - 0.5) < 0.01 && reason,
+      `play()=${plays}, currentTime=${t.toFixed(2)}, 原因日志=${reason}`);
+  }
+
+  // ---------- W: 广告结束打印耗时归因汇总 ----------
+  // 现场 18.2 秒里只有 1.8 秒真的在播广告，靠人工数日志才能看出来。
+  // 现在这条汇总直接给出：总时长 / 首次动手 / 强跳次数 / 媒体未就绪累计。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const opts = { duration: 15, currentTime: 0.5, paused: false, readyState: 0 };
+    const video = makeVideo(new JSDOM('').window, opts);
+    const { win, player, logs } = await loadPage(html, { video, debug: true });
+    await sleep(1500);                       // 全程 readyState=0，累计"媒体未就绪"
+    opts.readyState = 1;
+    await sleep(700);                        // 媒体就绪 -> 强跳
+    player.className = 'html5-video-player'; // 广告结束
+    await sleep(800);
+    const sum = logs.find((l) => l.indexOf('📊 广告结束') >= 0) || '';
+    const ready = logs.find((l) => l.indexOf('🎬 广告媒体就绪') >= 0) || '';
+    const m = /媒体未就绪累计 (\d+)ms/.exec(sum);
+    check('W 广告结束打印耗时归因汇总',
+      !!sum && !!ready && m && Number(m[1]) > 300,
+      sum || '（没有汇总日志）');
   }
 
   const failed = results.filter((r) => !r.pass);
