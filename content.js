@@ -45,7 +45,17 @@
  *  - 正片时长参照不再要求 >60s，短视频同样受"别误跳正片"保护
  *  - 消除"扩展已禁用但首次 tick 仍动作"的启动竞态；storage 监听在停机时解绑
  *  - 类名读取改用 getAttribute('class')，修正 SVG 元素取不到类名导致的检查失效
- *  - 清理死代码（onStuck / VERIFY_DELAY / lastSkipAttempt），版本号改读 manifest
+ * v1.2.7：Review 修复（性能 + 安全）
+ *  - [安全 S1] 点击延迟（300–900ms）期间元素可能被复用/挪进广告链接，点击前
+ *    重新复检 isSafeClickTarget；跳过按钮还要求仍在强广告态（TOCTOU 复检）
+ *  - [安全 S2] 视频层强跳（破坏性改 currentTime）改用更严格的 isRealVideoAd()
+ *    （仅 .ad-showing），overlay 类信号只用于点击路径，避免误跳正片
+ *  - [安全 S3] isSafeClickTarget 的祖先检查覆盖无 href 的 <a> 与 [role="link"]
+ *  - [安全 S4] findCloseButton 增加 adStateStrong() 门控，与跳过按钮一致
+ *  - [性能 P1] walkDeep 收集时预筛（只收按钮/广告相关节点），深扫节流 800→2000ms
+ *  - [性能 P2] adStateStrong 增加"单 tick 内"缓存，同 tick 多次调用只算一次
+ *  - [性能 P3] 文本兜底扫描（步骤 3）增加 2000ms 节流，避免每 tick 全量遍历
+ *  - [性能 P4] visibleText 对不可见元素直接早退，省去 TreeWalker 全文遍历
  */
 (() => {
   'use strict';
@@ -56,7 +66,7 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.2.4'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.2.7'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
@@ -150,6 +160,8 @@
   let seekHandler = null;
   let tickTimer = null;               // 节流用的待执行 tick
   let storageListener = null;         // 便于停机时解绑
+  let adStateCache = undefined;       // [P2] 本 tick 内的 adStateStrong 缓存（跨 tick 自动失效）
+  let lastTextScan = 0;               // [P3] 文本兜底扫描节流基准
 
   function shutdown(reason) {
     if (destroyed) return;
@@ -296,8 +308,9 @@
     let node = el;
     let depth = 0;
     while (node && depth++ < 20) {
-      // 当前 root 内的 <a href> 祖先 → 点击会跳转
-      if (node.closest && node.closest('a[href]')) return false;
+      // 当前 root 内的 <a>（有无 href 都算，无 href 的 a 也常靠 JS 跳转）
+      // 或 [role="link"] 祖先 → 点击会跳转/打开广告主页面
+      if (node.closest && node.closest('a, [role="link"]')) return false;
       // 广告创意 / "访问广告主" 区域
       if (node.closest && node.closest('[class*="ytp-ad-clickable"], [class*="ytp-ad-visit-advertiser"]')) return false;
       // 当前节点自身类名命中危险类（含 shadow 宿主）
@@ -428,6 +441,9 @@
     if (!el) return '';
     const cached = textCache.get(el);
     if (cached !== undefined) return cached;
+    // [P4] 不可见元素直接返回空：否则下面会对每个文本节点的父节点
+    // 调用 isVisible（遍历整条祖先链算 getComputedStyle），纯浪费。
+    if (!isVisible(el)) { textCache.set(el, ''); return ''; }
     let out = '';
     try {
       const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
@@ -456,7 +472,7 @@
     return COUNTDOWN_RE.test(visibleText(el));
   }
 
-  function scheduleClick(el, onDone, label) {
+  function scheduleClick(el, onDone, label, requireAd) {
     if (!el || isCoolingDown(el) || pendingSet.has(el)) return false;
     pendingSet.add(el);
     // 只有真正调度了点击才打日志，避免"找到按钮"日志在冷却期内刷屏
@@ -464,6 +480,12 @@
     setTimeout(() => {
       pendingSet.delete(el);
       if (destroyed || !enabled || isCoolingDown(el) || !document.contains(el)) return;
+      // [S1] TOCTOU 复检：点击延迟 300–900ms 期间，元素可能被复用、被挪进广告
+      // 链接（<a>/[role=link]），或广告已结束。点击前重新确认它仍然安全；
+      // 跳过按钮还要求仍在强广告态（requireAd），否则点一个已失效/被复用的节点
+      // 可能误触广告主落地页——这正是 v1.2.3「弹窗」问题的复发路径。
+      if (!isSafeClickTarget(el)) return;
+      if (requireAd && !adStateStrong()) return;
       clickElement(el);
       if (onDone) onDone();
     }, humanDelay());
@@ -534,15 +556,34 @@
   ];
 
   function adStateStrong() {
+    // [P2] 单 tick 内缓存：tick 开头会清空 adStateCache，
+    // 同一次 tick 里 findSkipButton / forceSkipAdViaVideo / emitDebugBeat
+    // 多次调用只计算一次（含多次 querySelector + isVisible），省下重复开销。
+    if (adStateCache !== undefined) return adStateCache;
+    const result = (function computeAdState() {
+      const p = document.querySelector('#movie_player, .html5-video-player');
+      if (p && p.classList && p.classList.contains('ad-showing')) return true;
+      if (document.querySelector('.ad-showing')) return true;
+      // 新版广告 UI 有时不挂 ad-showing，靠广告独有覆盖层判定
+      for (const sel of STRONG_AD_SELECTORS) {
+        let el = null;
+        try { el = document.querySelector(sel); } catch (_) { el = null; }
+        if (el && isVisible(el)) return true;
+      }
+      return false;
+    })();
+    adStateCache = result;
+    return result;
+  }
+
+  // [S2] 视频层强跳是"破坏性"操作（直接改 currentTime），一旦误判就是把正片
+  // 推到结尾，后果比"没跳过"严重得多。因此只用最硬的 .ad-showing 信号判定——
+  // overlay 类信号（.ytp-ad-overlay-container / .ytp-ad-progress-list 等）在正片
+  // 播放时也可能为真，不能用于此破坏性路径；它们仍服务于点击路径（adStateStrong）。
+  function isRealVideoAd() {
     const p = document.querySelector('#movie_player, .html5-video-player');
     if (p && p.classList && p.classList.contains('ad-showing')) return true;
     if (document.querySelector('.ad-showing')) return true;
-    // 新版广告 UI 有时不挂 ad-showing，靠广告独有覆盖层判定
-    for (const sel of STRONG_AD_SELECTORS) {
-      let el = null;
-      try { el = document.querySelector(sel); } catch (_) { el = null; }
-      if (el && isVisible(el)) return true;
-    }
     return false;
   }
 
@@ -597,7 +638,7 @@
     const now = Date.now();
     if (now - lastVideoSkip < 700) return false;
     if (now < adEndGuardUntil) return false;   // 广告刚结束，防误判保护窗口
-    if (!adStateStrong()) return false;
+    if (!isRealVideoAd()) return false;         // [S2] 破坏性操作，只用最硬的广告信号
 
     const player = document.querySelector('#movie_player, .html5-video-player');
     if (!player) return false;
@@ -703,7 +744,19 @@
     let els;
     try { els = root.querySelectorAll('*'); } catch (_) { return out; }
     for (const el of els) {
-      out.push(el);
+      // [P1] 预筛：只收可能是按钮/跳过相关的节点，避免后续对每个 div/span
+      // 都读 role/aria-label/title/class。实测 12k 节点时全量遍历占单次 tick 的
+      // 绝大部分开销，而普通标签（DIV/SPAN/P/A/IMG...）根本不可能是跳过按钮。
+      // tagName / className 是廉价属性读取；SVG 的 className 是对象，这里按 '' 处理。
+      const tg = el.tagName;
+      if (tg) {
+        const cn = typeof el.className === 'string' ? el.className : '';
+        if (tg === 'BUTTON' || tg === 'TP-YT-PAPER-BUTTON' || tg.indexOf('-') > 0 ||
+            cn.indexOf('ytp-') >= 0 || cn.indexOf('button') >= 0 ||
+            cn.indexOf('skip') >= 0 || cn.indexOf('ad-') >= 0) {
+          out.push(el);
+        }
+      }
       if (el.shadowRoot) walkDeep(el.shadowRoot, out, depth + 1);
     }
     return out;
@@ -713,9 +766,10 @@
   let lastDeepScan = 0;
   const deepRejectSeen = new WeakSet();
   function deepFindSkipButton() {
-    // 节流：至少间隔 800ms，避免高频 MutationObserver 下全量遍历卡顿
+    // 节流：至少间隔 2000ms。可跳过广告的倒计时通常 ≥5s，2s 一次足够，
+    // 且本函数会全量遍历播放器子树（即便有 P1 预筛仍不便宜），降低频率更稳。
     const now = Date.now();
-    if (now - lastDeepScan < 800) return null;
+    if (now - lastDeepScan < 2000) return null;
     lastDeepScan = now;
 
     const containers = Array.from(document.querySelectorAll(
@@ -803,6 +857,12 @@
     //    那是 YouTube 新版通用按钮组件，广告"跳过"按钮也由它渲染）。
     const adPlaying = isAdPlaying();
     if (adPlaying) {
+      // [P3] 文本兜底全量遍历（querySelectorAll 所有按钮 + 逐个读文本/属性）
+      // 相当昂贵，且只作"找不到标准按钮"时的最后一招。广告倒计时通常 ≥5s，
+      // 2000ms 一次足够，避免每 tick 都跑；标准选择器查找（步骤 1）仍每 tick 执行。
+      const nowT = Date.now();
+      if (nowT - lastTextScan < 2000) return null;
+      lastTextScan = nowT;
       const roots = Array.from(document.querySelectorAll('#movie_player, .html5-video-player, #player-ads, .ytp-ad-player-overlay, #player-mobile'));
       if (!roots.length) roots.push(document);
       for (const r of roots) {
@@ -838,6 +898,10 @@
   }
 
   function findCloseButton() {
+    // [S4] 关闭按钮只在明确广告态下查找（与跳过按钮一致）：否则非广告态的
+    // 偶发"关闭"按钮（如页面内其他 X）可能被误点；点击前的 isSafeClickTarget
+    // 复检（见 scheduleClick）仍会挡住被复用成广告链接的情况。
+    if (!adStateStrong()) return null;
     for (const sel of CLOSE_SELECTORS) {
       for (const node of queryAllSafe(sel)) {
         // 关闭按钮在部分布局里嵌在广告链接内部，点它会打开广告主页面 → 跳过
@@ -886,8 +950,11 @@
 
     // 清空"单次 tick 内"的 DOM 观察缓存。tick 内部不改 DOM，
     // 因此同一元素在一次扫描里算一次样式就够，不必重复询问。
+    // adStateCache 也在此重置：保证每次 tick 重新判定广告态，
+    // 避免跨 tick 用过期的缓存（见 adStateStrong 注释）。
     visCache.clear();
     textCache.clear();
+    adStateCache = undefined;
 
     // 强广告态跟踪：进入时记时间 + epoch+1，退出时清零
     if (adStateStrong()) {
@@ -931,7 +998,9 @@
     // 点它等于帮广告主打开了落地页（用户看到的弹出窗口）。
     const skipBtn = findSkipButton();
     if (skipBtn) {
-      const scheduled = scheduleClick(skipBtn, () => { epochActed = true; });
+      // 跳过按钮是"强广告态下"找到的，延迟期间广告可能已结束/元素被复用，
+      // 因此 requireAd=true：点击前要求仍在强广告态（见 scheduleClick 的 S1 复检）。
+      const scheduled = scheduleClick(skipBtn, () => { epochActed = true; }, null, true);
       if (!scheduled && debug && Date.now() - lastCoolLog > 6000) {
         lastCoolLog = Date.now();
         dlog('（跳过按钮已找到，处于冷却/排队中，暂不重复点击）');

@@ -48,7 +48,7 @@ function makeChrome(init) {
     },
   });
   return {
-    runtime: { id: 'test-ext', lastError: undefined, getManifest: () => ({ version: '1.2.6' }) },
+    runtime: { id: 'test-ext', lastError: undefined, getManifest: () => ({ version: '1.2.7' }) },
     storage: {
       sync: area(sync, 'sync'),
       local: area(local, 'local'),
@@ -203,6 +203,20 @@ function check(name, pass, detail) {
     check('F shadow 内跳过按钮既不被点击也不被调度（防落地页弹窗）',
       clicks === 0 && scheduled.length === 0,
       `clicks=${clicks}, 调度=${scheduled.length}`);
+  }
+
+  // ---------- G: 仅 overlay 信号、无 ad-showing -> 视频层强跳不得误伤正片（S2） ----------
+  // adStateStrong() 仍会因 .ytp-ad-overlay-container 返回 true（点击路径仍可用），
+  // 但视频层强跳（破坏性改 currentTime）现在用 isRealVideoAd() 仅看 .ad-showing，
+  // 正片不得被推到结尾。这是 S2 的核心价值：避免把正片跳到大结局。
+  {
+    // 正片正在播放（duration=600, currentTime=120），播放器带 overlay 类但无 ad-showing
+    const html = `<div id="movie_player" class="html5-video-player ytp-ad-overlay-container"></div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 600, currentTime: 120, paused: false });
+    const { win } = await loadPage(html, { video });
+    await sleep(1500);
+    const t = win.document.querySelector('video').__getTime();
+    check('G overlay 信号无 ad-showing 不误跳正片（S2）', Math.abs(t - 120) < 0.01, `currentTime=${t}`);
   }
 
   const failed = results.filter((r) => !r.pass);
