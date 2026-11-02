@@ -716,6 +716,38 @@ function check(name, pass, detail) {
       `心跳=${beat.slice(0, 46)}, currentTime=${t.toFixed(2)}`);
   }
 
+  // ---------- AH: 只有广告覆盖层、没有 .ad-showing -> 仍然强跳（v1.4.0）----------
+  // 现场（v1.3.9，连续 970 秒）：adPlaying= true / strong= true（覆盖层可见），
+  // 但强跳窗口只看 .ad-showing，于是一次都没动手，日志里连"未动进度"都没有。
+  {
+    const html = `<div id="movie_player" class="html5-video-player">
+        <div class="ytp-ad-player-overlay"></div>
+      </div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 15, currentTime: 0.5, paused: false });
+    const { win, logs } = await loadPage(html, { video, debug: true });
+    await sleep(2500);
+    const t = win.document.querySelector('video').__getTime();
+    check('AH 只有广告覆盖层（无 ad-showing）也强跳', t > 14,
+      `currentTime=${t.toFixed(2)}, 有强跳日志=${logs.some((l) => l.indexOf('强跳') >= 0)}`);
+  }
+
+  // ---------- AI: 残留态（正片时长 + 可见空壳按钮）-> 8s 判残留退出（v1.4.0）----------
+  // 现场：广告结束后 .ad-showing 残留、媒体变成 3225s 的正片，跳过按钮还是 86x36 的空壳。
+  // v1.3.9：点满预算 → 每 4 秒刷"冷却/排队中" → 📊 永不触发，一挂 700 秒。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing">
+        <button class="ytp-skip-ad-button">跳过</button>
+      </div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 3225, currentTime: 3.4, paused: false });
+    const { logs } = await loadPage(html, { video, debug: true });
+    await sleep(10000);
+    const residual = logs.some((l) => l.indexOf('判定为广告态残留') >= 0);
+    const summary = logs.some((l) => l.indexOf('📊 广告结束') >= 0);
+    const clicks = logs.filter((l) => l.indexOf('🖱️ 实际点击') >= 0).length;
+    check('AI 正片量级残留 8s 内退出、不写广告汇总',
+      residual && !summary && clicks <= 4, `残留=${residual}, 📊=${summary}, 点击=${clicks}`);
+  }
+
   const failed = results.filter((r) => !r.pass);
   console.log(`\n共 ${results.length} 项，通过 ${results.length - failed.length}，失败 ${failed.length}`);
   process.exit(failed.length ? 1 : 0);

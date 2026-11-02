@@ -159,6 +159,25 @@
  *  - [改动] "未动进度"同一原因改指数退避（5→10→20→40→60s）
  *  - [修正] 计数虚高：以前"期间动过手"就 +1，于是那支播到底的广告也被记成
  *    "自动跳过 1 次"。现在要求动作发生在广告结束前 5s 内
+ *
+ * v1.3.9：识别 ad-showing 残留（不再把正片当广告干等）
+ *  - [改动] computeAdState 分层：有 .ad-showing 且时长属正片量级时要求"可见跳过目标"
+ *  - [改动] 强跳窗口改由 isRealVideoAd()（仅 .ad-showing）驱动，统计按 lastUiAt 截止
+ *
+ * v1.4.0：修 v1.3.9 把窗口收得太窄带来的"看得见广告却不动手"+"残留态永不收尾"
+ *  - [事故] 现场日志（v1.3.9，30 分钟）：adPlaying= true / strong= true 连续 970 秒，
+ *    可这段时间一行强跳日志都没有 —— 因为窗口只看 .ad-showing，而当时 .ad-showing= false、
+ *    只有广告覆盖层可见。用户看到的正是"广告在播，扩展一次都没动手"
+ *  - [事故] 广告结束后 .ad-showing 残留且媒体变成 3225s（正片量级），跳过按钮仍是
+ *    86x36 的可见壳：旧判定"有可见跳过目标就是真广告"，于是点满 4 次熔断，
+ *    然后每分钟刷"冷却/排队中"，📊 广告结束永不触发（挂 700 秒）
+ *  - [改动] 强跳窗口 = .ad-showing **或**（可见广告覆盖层 **且** 媒体时长是广告量级）。
+ *    覆盖层广告（新版 UI 不挂类名）重新能跳；覆盖层残留 + 正片时长不开窗，不刷日志
+ *  - [改动] 残留看门狗 AD_RESIDUAL_EXIT_MS：窗口开着但媒体时长属正片量级并持续 8s
+ *    → 判残留、打一条 🧹（带 dur/点击次数/最后看到 UI 的时间）、退出等待并静默 60s。
+ *    静默只在"媒体时长变回广告量级"或"广告 UI 消失"时解除 —— 真广告来了照样跳
+ *  - [改动] 心跳 3s 档只在"可能真的会动手"时用（有按钮，或媒体是广告量级），
+ *    其余一律 15s。残留态不再每 3s 刷一行
  */
 (() => {
   'use strict';
@@ -169,7 +188,7 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.3.9'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.4.0'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
@@ -837,6 +856,17 @@
     '.ytp-ad-duration-remaining',
   ];
 
+  // 广告"创意层"：这些容器是广告画面/素材的载体，只在广告播放时渲染。
+  // 与 STRONG_AD_SELECTORS 的区别：不含跳过按钮壳、进度条这类"广告结束后仍留壳"的节点。
+  // v1.4.0 用它给"没有 .ad-showing 的覆盖层广告"开一条受限的强跳准入（见 overlayOnlyAd）。
+  const AD_FRAME_SELECTORS = [
+    '.ytp-ad-player-overlay',
+    '.ytp-ad-player-overlay-layout',
+    '.ytp-ad-player-overlay-skip-or-preview',
+    '.ytp-ad-overlay-container',
+    '.ima3-ad-container',
+  ];
+
   // v1.3.9：广告态判定加入"残留识别"。
   // 背景：广告结束后 .ad-showing 可能残留，此时正片在播。v1.3.8 现场一支 341.8s
   // 正片被当成广告，干等近 10 分钟、统计虚报 360s。
@@ -902,6 +932,44 @@
     return false;
   }
 
+  // v1.4.0：强跳窗口信号。
+  // 事故（v1.3.9 现场，30 分钟日志）：`adPlaying= true`+`strong= true` 连续持续 970 秒，
+  // 期间一行强跳日志都没有 —— 因为窗口被收成"只看 .ad-showing"，而当时
+  // `.ad-showing= false`、广告覆盖层却明明可见。用户看到的就是"广告在播，扩展不动手"。
+  // 现在的口径：
+  //   a) `.ad-showing` → 开窗（最硬的信号；此时媒体可能还没换源，dur 仍是正片，不能挡）
+  //   b) 可见广告覆盖层 **且** 媒体时长是广告量级 → 开窗（新版 UI 有时不挂类名）
+  // 覆盖层残留 + 正片时长（3225s / 5536s 这类）不开窗：那里本来也没有可跳的东西，
+  // 开窗只会换来每 40 秒一行"未动进度"和永不结束的广告态。
+  function adWindowSignal() {
+    if (isRealVideoAd()) return true;
+    const dur = mediaDur();
+    if (!isFinite(dur) || dur > AD_MAX_DURATION) return false;
+    for (const sel of AD_FRAME_SELECTORS) {
+      let el = null;
+      try { el = document.querySelector(sel); } catch (_) { el = null; }
+      if (el && isVisible(el)) return true;
+    }
+    return false;
+  }
+
+  // v1.4.0：没有 .ad-showing 时的"覆盖层广告"准入（给破坏性的强跳用）。
+  // 为什么不能直接放开 [S2]：覆盖层信号在正片里也可能可见（#player-ads 常驻、
+  // 跳过按钮会留 86x36 的空壳）。所以这里多加两个约束：
+  //   a) 只认"广告创意层"选择器（AD_FRAME_SELECTORS），不含 #player-ads / 跳过按钮壳
+  //   b) 媒体时长必须是广告量级（>0 且 ≤ AD_MAX_DURATION）
+  // 于是"覆盖层可见但正片在播"依然动不了进度——S2 的本意完整保留。
+  function overlayOnlyAd() {
+    const dur = mediaDur();
+    if (!isFinite(dur) || dur > AD_MAX_DURATION) return false;
+    for (const sel of AD_FRAME_SELECTORS) {
+      let el = null;
+      try { el = document.querySelector(sel); } catch (_) { el = null; }
+      if (el && isVisible(el)) return true;
+    }
+    return false;
+  }
+
   // ---------------- 视频层强跳（不依赖任何按钮 DOM） ----------------
   // 广告本质上是播放器在播另一段视频：把它的播放进度推到结尾，广告就立刻结束。
   // 这条路径绕开"按钮找不到 / 按钮是空壳 / shadow 点击无效"的所有问题，
@@ -951,6 +1019,15 @@
   let adLastActionAt = 0;               // 本次广告内最后一次真的动手的时间
   let durTooLongLogged = 0;             // 已经解释过"时长超过 AD_MAX_DURATION"的那个时长
 
+  // ---- v1.4.0：残留看门狗 ----
+  // 现场（v1.3.9）：广告结束后 .ad-showing 残留、媒体变成 3225s 的正片，跳过按钮还是
+  // 86x36 的可见空壳。旧判定把它当真广告，点满 4 次熔断后每 4 秒刷一行"冷却/排队中"，
+  // 📊 广告结束永不触发，一挂就是 700 秒。这里给"窗口开着但媒体是正片量级"设个上限。
+  const AD_RESIDUAL_EXIT_MS = 8000;     // 连续这么久都只有正片量级时长 → 判残留
+  const AD_RESIDUAL_QUIET_MS = 60000;   // 判残留后的静默期（真广告来了会提前解除，见 tick）
+  let residualSince = 0;                // 本轮"疑似残留"的起始时间（0 = 当前不怀疑）
+  let residualQuietUntil = 0;           // 静默到这个时间为止（期间不再因同一个残留 UI 进广告态）
+
   // 广告结束后把播放速度还原，别把正片也加速了
   function releaseRateBoost() {
     if (!rateBoostEl) return;
@@ -964,6 +1041,13 @@
   function currentVideo() {
     const p = document.querySelector('#movie_player, .html5-video-player');
     return p ? p.querySelector('video') : null;
+  }
+
+  // 当前媒体的时长（拿不到 NaN）。"是不是广告量级"是 v1.4.0 的核心判据，
+  // 单独包一层免得各处重复读 currentVideo + 判 isFinite。
+  function mediaDur() {
+    const v = currentVideo();
+    return v && isFinite(v.duration) && v.duration > 0 ? v.duration : NaN;
   }
 
   // 非广告态持续记录正片时长：广告里若出现"时长≈正片时长"的视频，
@@ -1058,7 +1142,9 @@
     const now = Date.now();
     if (now - lastVideoSkip < 700) return false;
     if (now < adEndGuardUntil) return false;   // 广告刚结束，防误判保护窗口
-    if (!isRealVideoAd()) return false;         // [S2] 破坏性操作，只用最硬的广告信号
+    // [S2] 破坏性操作：默认只认最硬的 .ad-showing；"只有覆盖层"的广告（新版 UI 不挂类名）
+    // 走受限准入 overlayOnlyAd()——广告创意层可见 + 媒体时长是广告量级，两条同时满足才动手。
+    if (!isRealVideoAd() && !overlayOnlyAd()) return false;
 
     const player = document.querySelector('#movie_player, .html5-video-player');
     if (!player) return false;
@@ -1503,7 +1589,12 @@
     const hitCount = SKIP_SELECTORS.reduce((n, s) => n + queryAllSafe(s).length, 0);
     const sig = (strong ? 1 : 0) + '|' + (adPlaying ? 1 : 0) + '|' + (adShowing ? 1 : 0) + '|' + hitCount;
     const now = Date.now();
-    const interval = Math.max(minGap || 0, strong ? 3000 : 15000);
+    // v1.4.0：3 秒档只留给"可能真的会动手"的状态（有按钮，或媒体是广告量级）。
+    // 残留态 strong 也可能是 true（覆盖层 / 空壳按钮可见），按 3s 打就是纯噪音 ——
+    // 上一版现场 286 行日志里绝大多数都是这种重复心跳。
+    const dNow = mediaDur();
+    const canAct = strong && (hitCount > 0 || (isFinite(dNow) && dNow <= AD_MAX_DURATION));
+    const interval = Math.max(minGap || 0, canAct ? 3000 : 15000);
     if (sig !== lastBeatSig || now - lastDebugBeat > interval) {
       lastBeatSig = sig;
       lastDebugBeat = now;
@@ -1515,10 +1606,36 @@
     }
   }
 
+  // v1.4.0：判定"广告态残留"并退出等待。
+  // 和正常结束的区别：不打 📊（那会把一段正片时长记成广告时长）、不计数，
+  // 并且静默一段时间——否则同一个残留 UI 每 tick 都会把我们重新拉进广告态。
+  function exitResidual(reason) {
+    const startedAt = adStateSince;
+    const uiAt = (lastUiAt && lastUiAt > startedAt) ? lastUiAt - startedAt : 0;
+    adStateSince = 0;
+    residualSince = 0;
+    residualQuietUntil = Date.now() + AD_RESIDUAL_QUIET_MS;
+    adEndGuardUntil = Date.now() + 1500;
+    seekFails = 0;
+    jumpTarget = 0;
+    jumpEl = null;
+    jumpDur = 0;
+    endStallSince = 0;
+    releaseRateBoost();                     // 万一刚开过 16× 加速，这里要还回去
+    lastVskipWhy = '';
+    epochActed = false;
+    const d = mediaDur();
+    dlog('🧹 判定为广告态残留（' + reason + '）：退出等待，本段不计数',
+      '| 广告态持续', Date.now() - startedAt, 'ms',
+      '| 最后看到广告 UI 于', uiAt ? '+' + uiAt + 'ms' : '（全程没看到）',
+      '| dur=', Math.round(d * 10) / 10,
+      '| mainDur=', Math.round(mainDur * 10) / 10,
+      '| 已点击', CLICK_BUDGET - clickBudget, '次');
+  }
+
   function tick() {
     if (destroyed || !enabled || document.hidden) return;
     if (!contextAlive()) { shutdown('扩展上下文已失效'); return; }
-
     // 清空"单次 tick 内"的 DOM 观察缓存。tick 内部不改 DOM，
     // 因此同一元素在一次扫描里算一次样式就够，不必重复询问。
     // adStateCache 也在此重置：保证每次 tick 重新判定广告态，
@@ -1529,12 +1646,18 @@
     adStateCache = undefined;
 
     // 强广告态跟踪：进入时记时间 + epoch+1，退出时清零
-    // v1.3.9：这里改用 isRealVideoAd()（仅 .ad-showing）驱动强跳窗口——
-    // 广告 UI 还没渲染的瞬间也要能强跳。adStateStrong 现在是"可见 UI"双条件，
-    // 只服务点击/统计/心跳，不再当强跳开关，否则纯 .ad-showing 的广告会不强跳。
-    if (isRealVideoAd()) {
+    // v1.4.0：窗口信号放宽为「.ad-showing 或 可见广告覆盖层（且媒体是广告量级）」。
+    // v1.3.9 把它收成只看 .ad-showing 之后，覆盖层可见却没挂类名的广告整段不动手。
+    const winSig = adWindowSignal();
+    if (residualQuietUntil) {
+      // 静默解除：广告 UI 消失（残留没了）或 媒体时长变回广告量级（真广告来了）
+      const d = mediaDur();
+      if (!winSig || (isFinite(d) && d <= AD_MAX_DURATION)) residualQuietUntil = 0;
+    }
+    if (winSig && !residualQuietUntil) {
       if (!adStateSince) {
         adStateSince = Date.now();
+        residualSince = 0;
         adEpoch += 1;
         epochActed = false;
         lastUiAt = 0;          // v1.3.9：新广告，UI 时间重新记
@@ -1551,11 +1674,22 @@
         resetAdStats(adStateSince);
         lastVskipWhy = '';                    // 新一次广告，诊断从第一行重新打
         dlog('📺 检测到广告开始（第', adEpoch, '次）');
+      } else {
+        // v1.4.0 残留看门狗：窗口开着，可媒体时长一直是正片量级 —— forceSkip 反正也不会动
+        // （dur > AD_MAX_DURATION 那条直接拒绝），多半是 .ad-showing / 覆盖层的残留。
+        const d = mediaDur();
+        if (isFinite(d) && d > AD_MAX_DURATION) {
+          if (!residualSince) residualSince = Date.now();
+          else if (Date.now() - residualSince >= AD_RESIDUAL_EXIT_MS) exitResidual('媒体时长属正片量级');
+        } else {
+          residualSince = 0;
+        }
       }
     } else {
       if (adStateSince) {
         const adStartedAt = adStateSince;      // 汇总要用，先存下来
         adStateSince = 0;
+        residualSince = 0;
         adEndGuardUntil = Date.now() + 1500;   // 广告结束后的保护窗口
         seekFails = 0;
         jumpTarget = 0;
