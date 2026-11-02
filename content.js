@@ -128,6 +128,20 @@
  *  - [实验] 推完一支广告后若 video 长期停在 readyState=0，补一次 play() 触发
  *    它的资源加载算法（上限 3 次、间隔 1.2s）。现场那 7~9 秒切流如果只是
  *    "取流没被拉起"，这一下能省掉；日志会打出"催流 play()（第 N 次）"以便验证
+ *
+ * v1.3.7：📊 汇总证明优化空间已经很小，只剩"我们自己设的门"值得动
+ *  - [数据] 现场两支广告（15s + 37.5s）总共 3951ms 结束，其中媒体未就绪
+ *    2022ms（51%，YouTube 侧）；首次动手 1114ms；强跳 2 次
+ *  - [结论] 首次动手的 1114ms 里，媒体就绪只到 707ms，剩下 407ms 是我们自己
+ *    的 800ms 确认窗口 + `ct<0.3` 等待
+ *  - [结论] 第二支更糟：媒体 +2930ms 就绪时 ct=0，它起播卡住，3 个 tick 才
+ *    爬过 0.3 —— `ct<0.3` 这条门白吃 800ms，而我们什么都做不了
+ *  - [改动] 起播期（ct<0.3）也直接强跳：元素有元数据就能 seek，贴尾 seek
+ *    不依赖"真的播起来了"。宽容 EARLY_SEEK_MAX=2 次，这次 seek 标记为
+ *    provisional —— 被播放器在真正起播时重置不算"seek 无效"，不会把
+ *    seekFails 顶到 2 误开 16× 加速；宽容用完回到原来的等待逻辑
+ *  - [保留] 800ms 确认窗口不动。它不是"反应慢"，是"打开链接先播广告"时
+ *    mainDur 未知、唯一能防"把正片推到大结局"的东西
  */
 (() => {
   'use strict';
@@ -138,7 +152,7 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.3.6'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.3.7'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
@@ -825,6 +839,9 @@
   let mainDur = 0;               // 最近一次"非广告态"观察到的正片时长
   let adEndGuardUntil = 0;       // 广告刚结束的一小段时间内禁止动进度
   let jumpTarget = 0;            // 上次 seek 的目标位置（0 = 无需校验）
+  let jumpProvisional = false;   // 上次 seek 是在"广告还没真的起播"时下的（v1.3.7）
+  let earlySeeks = 0;            // 本次广告里"起播期 seek"已用掉几次（v1.3.7）
+  const EARLY_SEEK_MAX = 2;      // 起播期 seek 的宽容次数，用完后回到原来的 ct>=0.3 等待
   let jumpEl = null;             // 上次 seek 的那个 video 元素
   let jumpDur = 0;               // 上次 seek 时该视频的总时长（用于识别"已经换了一支广告"）
   let seekFails = 0;             // 连续 seek 无效次数
@@ -883,6 +900,8 @@
     pendingSet = new WeakSet();
     videoSkipTimes = new WeakMap();
     nudgeTimes = new WeakMap();
+    earlySeeks = 0;
+    jumpProvisional = false;
   }
 
   // ---- v1.3.5：广告耗时归因 ----
@@ -960,14 +979,23 @@
       const pv = (jumpEl && isAttached(jumpEl)) ? jumpEl : currentVideo();
       const sameClip = pv && isFinite(pv.duration) && Math.abs(pv.duration - jumpDur) <= 1;
       if (pv && sameClip && isFinite(pv.currentTime) && pv.currentTime < jumpTarget - 2) {
-        seekFails += 1;
-        dlog('⏩ 上次 seek 未生效（currentTime=', Math.round(pv.currentTime * 10) / 10,
-          '目标=', Math.round(jumpTarget * 10) / 10, '），连续第', seekFails, '次');
+        // v1.3.7：起播期下的 seek 本来就容易被播放器在"真正起播"时重置，
+        // 这不能算"seek 无效"——否则会白白把 seekFails 顶到 2 并触发 16× 加速。
+        // 宽容次数由 EARLY_SEEK_MAX 控制，用完之后一切照旧。
+        if (jumpProvisional) {
+          dlogReject('earlyseek', '⏩ 起播期 seek 被丢弃（不算无效）：currentTime=',
+            Math.round(pv.currentTime * 10) / 10, '目标=', Math.round(jumpTarget * 10) / 10);
+        } else {
+          seekFails += 1;
+          dlog('⏩ 上次 seek 未生效（currentTime=', Math.round(pv.currentTime * 10) / 10,
+            '目标=', Math.round(jumpTarget * 10) / 10, '），连续第', seekFails, '次');
+        }
       } else if (sameClip) {
         seekFails = 0;
       }
       // 时长变了 = 已经换了一支广告，上一次的结果无从判断，计数保持不变
       jumpTarget = 0;
+      jumpProvisional = false;
     }
 
     // v1.3.4：诊断用。之前所有 continue 都是静默的，"广告开始 → 强跳"实测要 1.9s，
@@ -1037,7 +1065,19 @@
           '| currentTime=', Math.round(ct * 10) / 10);
         continue;
       }
-      if (ct < 0.3) { why = why || 'currentTime<0.3'; continue; }   // 刚起播，等它真的在放
+      // v1.3.7：广告起播慢的时候，`ct < 0.3` 这条门比媒体加载还贵。
+      // 现场日志（v1.3.6）第二支广告：媒体 +2930ms 就绪时 ct= 0，可它起播卡住，
+      // 3 个 tick 后才爬过 0.3——这 800ms 我们什么都做不了，纯粹在等时钟。
+      // 事实上贴尾 seek 在 ct≈0 时照样有效（元素有元数据就能 seek），所以改成：
+      // 起播期也直接动手，但只宽容 EARLY_SEEK_MAX 次，并且这次 seek 记成 provisional
+      // （被播放器重置不算"seek 无效"，见上面的校验）。宽容用完仍不动就回到旧的等待。
+      // 注意：不要用 v.seekable.length 当门。广告元素刚换源时 seekable 经常是空的
+      // （连 jsdom 里非媒体元素也恒为空），按它判会退回到"什么都不做"的老毛病。
+      const early = ct < 0.3;   // 刚起播，进度还没走过 0.3 秒
+      if (early && earlySeeks >= EARLY_SEEK_MAX) {
+        why = why || 'currentTime<0.3（起播期已宽容' + EARLY_SEEK_MAX + '次）';
+        continue;
+      }
 
       const t = videoSkipTimes.get(v);
       if (t && now - t < VIDEO_SKIP_GAP) { why = why || '跳转间隔内'; continue; }
@@ -1085,11 +1125,14 @@
         jumpTarget = Math.max(0, dur - 0.05);
         jumpEl = v;
         jumpDur = dur;
+        jumpProvisional = early;
+        if (early) earlySeeks += 1;
         v.currentTime = jumpTarget;
         adJumpCount += 1;
         markAdAction(now);
         dlog('⏩ 视频层强跳：duration=', Math.round(dur * 10) / 10,
-          '→ currentTime=', Math.round(v.currentTime * 10) / 10);
+          '→ currentTime=', Math.round(v.currentTime * 10) / 10,
+          early ? '（起播期 ct=' + (Math.round(ct * 10) / 10) + '，第 ' + earlySeeks + ' 次尝试）' : '');
         epochActed = true;
         return true;
       } catch (err) {

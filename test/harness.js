@@ -579,6 +579,42 @@ function check(name, pass, detail) {
       resp ? `count=${resp.count}, debug=${resp.debug}` : '无响应');
   }
 
+  // ---------- Z: 广告起播卡在 ct=0 也直接强跳（v1.3.7）----------
+  // 现场日志（v1.3.6）：第二支广告媒体就绪时 ct=0，起播卡住，3 个 tick 后才爬过
+  // 0.3——`ct < 0.3` 这条门白吃 800ms。贴尾 seek 在 ct≈0 时其实照样有效。
+  {
+    const html = `<div id="movie_player" class="html5-video-player"></div>`;
+    const opts = { duration: 600, currentTime: 120, paused: false };
+    const video = makeVideo(new JSDOM('').window, opts);
+    const { win, player, logs } = await loadPage(html, { video, debug: true });
+    await sleep(700);                        // 先记下 mainDur=600（跳过 800ms 确认窗口）
+    opts.duration = 15;                      // 切广告
+    video.currentTime = 0;                   // 起播卡在 0：时钟一直不走
+    player.classList.add('ad-showing');
+    await sleep(900);
+    const t = win.document.querySelector('video').__getTime();
+    const earlyLog = logs.some((l) => l.indexOf('起播期 ct=') >= 0);
+    check('Z 广告起播卡在 ct=0 也直接强跳（不等 0.3s）',
+      t > 14 && earlyLog, `currentTime=${t.toFixed(2)}, 起播期日志=${earlyLog}`);
+  }
+
+  // ---------- AA: 起播期 seek 被播放器丢弃 -> 不计入 seekFails、不误触 16× ----------
+  // 宽容必须有限：起播期 seek 最多放宽 EARLY_SEEK_MAX 次，用完之后回到原来的等待，
+  // 免得"seek 一直被忽略"变成无限重试，也免得把 seekFails 顶到 2 误开 16× 加速。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const video = makeVideo(new JSDOM('').window,
+      { duration: 15, currentTime: 0, paused: false, seekable: false, rate: 1 });
+    const { win, logs } = await loadPage(html, { video, debug: true });
+    await sleep(4400);                       // 宽容 2 次用完（tick 间隔约 1.2s）
+    const v = win.document.querySelector('video');
+    const dropped = logs.some((l) => l.indexOf('起播期 seek 被丢弃') >= 0);
+    const capped = logs.some((l) => l.indexOf('起播期已宽容') >= 0);
+    check('AA 起播期 seek 被丢弃不算无效、不误触 16× 加速',
+      v.playbackRate === 1 && dropped && capped,
+      `rate=${v.playbackRate}, 丢弃日志=${dropped}, 宽容用完=${capped}`);
+  }
+
   const failed = results.filter((r) => !r.pass);
   console.log(`\n共 ${results.length} 项，通过 ${results.length - failed.length}，失败 ${failed.length}`);
   process.exit(failed.length ? 1 : 0);
