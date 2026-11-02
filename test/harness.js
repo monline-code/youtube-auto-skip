@@ -458,6 +458,21 @@ function check(name, pass, detail) {
     check('S 0×0 按钮的点击升级到有尺寸的外壳', shellClicks > 0, `shell clicks=${shellClicks}`);
   }
 
+  // ---------- T: 广告贴尾但被暂停 -> 主动续播（现场 9.2s 卡顿）----------
+  // 日志里第一支跳到 27.7 后，播放器暂停等切流，之后 9.2 秒 tick 全被
+  // "暂停中不动进度"静默挡掉，用户看到的就是广告一直挂着。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const opts = { duration: 15, currentTime: 14.8, paused: true };
+    const video = makeVideo(new JSDOM('').window, opts);
+    let plays = 0;
+    video.play = () => { plays += 1; return Promise.resolve(); };
+    const { win } = await loadPage(html, { video });
+    await sleep(1400);
+    const t = win.document.querySelector('video').__getTime();
+    check('T 广告贴尾且暂停时主动续播', plays > 0, `play() ${plays} 次, currentTime=${t.toFixed(2)}`);
+  }
+
   const failed = results.filter((r) => !r.pass);
   console.log(`\n共 ${results.length} 项，通过 ${results.length - failed.length}，失败 ${failed.length}`);
   process.exit(failed.length ? 1 : 0);

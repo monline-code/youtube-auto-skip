@@ -101,6 +101,16 @@
  *  - [节奏] 强跳不再统一等 800ms：能证明"时长相较正片明显不同"时就立刻动手，
  *    只有 mainDur 还没有参照值（打开链接先播广告）时才保留 800ms 确认窗口
  *  - 拒绝日志补 cssHidden 字段，把"0×0"和"被 CSS 判隐藏"区分开
+ *
+ * v1.3.4：带时间戳的现场日志（v1.3.3）暴露的两件事
+ *  - [真 bug] 广告贴尾后若被暂停，`if (v.paused) continue` 会静默挡掉所有重试，
+ *    广告长时间挂在最后一帧（现场：跳完 27.8s 那支后过了 9.2s 才切下一支）。
+ *    现在贴尾 + 暂停时主动补一次 seek 并 play()，用 900ms 节流避免骚扰
+ *  - [诊断] forceSkipAdViaVideo 里所有 continue 原本都是静默的，
+ *    "广告开始 → 强跳"实测 1.9s 却看不出这一秒多花在哪。补一条节流日志，
+ *    输出 readyState / duration / mainDur / 广告已持续时长
+ *  - [修正] seek 校验里的 document.contains(jumpEl) 换成 isAttached()：
+ *    前者对 shadow root 内节点恒为 false（v1.2.8 修过同类问题，这里漏了）
  */
 (() => {
   'use strict';
@@ -111,7 +121,7 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.3.3'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.3.4'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
@@ -813,7 +823,9 @@
     // 先校验上一次 seek 是否真的生效：有的广告播放器会忽略 currentTime 赋值。
     // 若被忽略（进度明显落后于目标），累计失败次数，转为加速播放。
     if (jumpTarget > 0) {
-      const pv = (jumpEl && document.contains(jumpEl)) ? jumpEl : currentVideo();
+      // v1.3.4：用 isAttached 而不是 document.contains —— 后者对 shadow root 内的
+      // 节点恒为 false，会把有效的 video 判成"已脱离"，白白丢掉 seek 校验。
+      const pv = (jumpEl && isAttached(jumpEl)) ? jumpEl : currentVideo();
       const sameClip = pv && isFinite(pv.duration) && Math.abs(pv.duration - jumpDur) <= 1;
       if (pv && sameClip && isFinite(pv.currentTime) && pv.currentTime < jumpTarget - 2) {
         seekFails += 1;
@@ -826,14 +838,21 @@
       jumpTarget = 0;
     }
 
-    for (const v of player.querySelectorAll('video')) {
-      if (!v || v.readyState < 1) continue;
+    // v1.3.4：诊断用。之前所有 continue 都是静默的，"广告开始 → 强跳"实测要 1.9s，
+    // 完全看不出这一秒多花在 readyState、currentTime<0.3 还是 tick 没跑到。
+    const vids = player.querySelectorAll('video');
+    let acted = false;
+    let why = '';
+
+    for (const v of vids) {
+      if (!v) continue;
       const dur = v.duration;
-      if (!isFinite(dur) || dur <= 0 || dur > AD_MAX_DURATION) continue;
-      if (v.paused) continue;                          // 暂停中不动进度
-      if (v.currentTime < 0.3) continue;               // 刚起播，等它真的在放
+      const ct = v.currentTime;
+      if (v.readyState < 1) { why = why || ('readyState=' + v.readyState); continue; }
+      if (!isFinite(dur) || dur <= 0 || dur > AD_MAX_DURATION) { why = why || ('dur=' + dur); continue; }
       // 时长与正片一致 → 这是正片，绝不碰（避免"跳到大结局"）
       if (mainDur && Math.abs(dur - mainDur) <= 1) {
+        why = why || '时长与正片一致';
         dlogReject('maindur', '⏩ 时长与正片一致（', Math.round(dur * 10) / 10, 's），判定为正片，不动进度');
         continue;
       }
@@ -841,14 +860,37 @@
       // 不再统一等 800ms——那 0.8 秒是用户"看得见按钮、广告还在播"的主要来源。
       // 证明不了（mainDur 还没记到，例如"打开链接先播广告"）时保留确认窗口，
       // 否则可能把正片当广告推到片尾，这个风险不值得省那 0.8 秒。
-      if (!(mainDur > 0) && now - adStateSince < AD_SKIP_CONFIRM_MS) continue;
+      if (!(mainDur > 0) && now - adStateSince < AD_SKIP_CONFIRM_MS) {
+        why = why || '确认窗口未满';
+        continue;
+      }
+
+      const atEnd = dur - ct < 1;
+
+      // v1.3.4：广告已贴尾却被暂停 —— 播放器在等"广告结束/切下一支"的指令，
+      // 网络或广告服务一慢就会长时间挂着（现场日志：跳完 27.8s 那支后，过了 9.2s
+      // 才切到下一支，期间 tick 全被 "暂停中不动进度" 静默挡掉）。
+      // 这里主动补一次 seek + play 把它推过去；用 videoSkipTimes 节流，别每 tick 骚扰。
+      if (v.paused) {
+        if (!atEnd) { why = why || 'paused'; continue; }
+        const t2 = videoSkipTimes.get(v);
+        if (t2 && now - t2 < VIDEO_SKIP_GAP) { why = why || '贴尾暂停（刚催过）'; continue; }
+        videoSkipTimes.set(v, now);
+        lastVideoSkip = now;
+        try { v.currentTime = Math.max(0, dur - 0.05); } catch (_) { /* ignore */ }
+        try { v.play(); } catch (_) { /* ignore */ }
+        acted = true;
+        dlog('⏩ 广告贴尾但被暂停（多半在等切流），主动续播：duration=', Math.round(dur * 10) / 10,
+          '| currentTime=', Math.round(ct * 10) / 10);
+        continue;
+      }
+      if (ct < 0.3) { why = why || 'currentTime<0.3'; continue; }   // 刚起播，等它真的在放
 
       const t = videoSkipTimes.get(v);
-      if (t && now - t < VIDEO_SKIP_GAP) continue;
+      if (t && now - t < VIDEO_SKIP_GAP) { why = why || '跳转间隔内'; continue; }
 
       // 贴尾判定：有的广告播放器接受 currentTime 赋值后并不触发 ended，
       // 广告就永远停在最后一帧。贴尾超过 END_STALL_MS 仍未结束 → 改用加速。
-      const atEnd = dur - v.currentTime < 1;
       if (atEnd) {
         if (!endStallSince) endStallSince = now;
       } else if (endStallSince) {
@@ -898,6 +940,14 @@
       } catch (err) {
         dlog('⏩ 视频层强跳失败:', String(err && err.message));
       }
+    }
+    // v1.3.4：没动手就把原因记下来（节流 3s），否则"广告播了 1.9 秒才跳"永远
+    // 说不清是 readyState、currentTime<0.3、确认窗口，还是 tick 根本没跑到。
+    if (!acted && debug && why) {
+      dlogReject('vskip', '⏩ 本 tick 未动进度：', why,
+        '| 候选 video=', vids.length,
+        '| 广告已持续=', now - adStateSince, 'ms',
+        '| mainDur=', mainDur);
     }
     return false;
   }
