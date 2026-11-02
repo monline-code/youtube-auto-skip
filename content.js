@@ -193,6 +193,16 @@
  *  - [改动] 残留看门狗改判"媒体时长≈正片"，不再拿 300s 当分界线 ——
  *    否则长广告一进来就被当成残留退出，反而更跳不掉
  *  - [日志] 🚫 不再断言"多半是残留"，改成说清"没有正片时长作参照，不敢推"
+ *
+ * v1.4.2：补上"广告在播但没挂 .ad-showing"这条通道
+ *  - [事故] 同一份日志的前 970 秒（≈16 分钟）：`adPlaying= true | .ad-showing= false |`
+ *    `命中数= 0`，心跳一直 `strong= true`（说明有广告覆盖层可见），可强跳窗口既不看
+ *    adPlaying 也不看这个覆盖层 —— 整段没开窗，一次都没动手
+ *  - [改动] 新增 adPlayingOtherMedia()：**YouTube 说广告在播**（.ad-interrupting /
+ *    可见广告覆盖层）+ **媒体时长已证明 ≠ 正片** → 认定为广告，开窗并允许强跳。
+ *    单看前者会误伤（#player-ads 在正片里也常驻可见），单看后者不够，两个一起才硬
+ *  - [改动] 强跳成功 / `yt-navigate-finish` 后作废 mainDur：新上场的正片时长若与
+ *    上一支不同，旧参照会把新正片判成"不是正片"。作废后退回保守一侧（宁漏跳）
  */
 (() => {
   'use strict';
@@ -203,7 +213,7 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.4.1'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.4.2'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
@@ -299,6 +309,7 @@
   let observer = null;
   let pollTimer = null;
   let seekHandler = null;
+  let navHandler = null;              // YouTube SPA 导航（换视频）监听，用于作废 mainDur
   let tickTimer = null;               // 节流用的待执行 tick
   let storageListener = null;         // 便于停机时解绑
   let adStateCache = undefined;       // [P2] 本 tick 内的 adStateStrong 缓存（跨 tick 自动失效）
@@ -314,6 +325,7 @@
     try { if (pollTimer) clearInterval(pollTimer); } catch (_) { /* ignore */ }
     try { if (tickTimer) clearTimeout(tickTimer); } catch (_) { /* ignore */ }
     try { if (seekHandler) document.removeEventListener('seeked', seekHandler, true); } catch (_) { /* ignore */ }
+    try { if (navHandler) document.removeEventListener('yt-navigate-finish', navHandler); } catch (_) { /* ignore */ }
     if (storageListener) {
       try { chrome.storage.onChanged.removeListener(storageListener); } catch (_) { /* ignore */ }
       storageListener = null;
@@ -322,6 +334,7 @@
     pollTimer = null;
     tickTimer = null;
     seekHandler = null;
+    navHandler = null;
   }
 
   // 安全地访问 storage：上下文失效时自动停机和访问
@@ -961,6 +974,9 @@
   // 每 40 秒一行"未动进度"和永不结束的广告态。
   function adWindowSignal() {
     if (isRealVideoAd()) return true;
+    // v1.4.2：广告覆盖层可见（strong 为真）+ 时长已证明不是正片 → 开窗。
+    // 现场那 16 分钟全程没有 .ad-showing，只有这条能把它认出来。
+    if (adPlayingOtherMedia()) return true;
     const dur = mediaDur();
     // v1.4.1：长广告（已证明不是正片）同样开窗 —— 否则覆盖层广告只要超过 5 分钟，
     // 窗口就永远不开，用户看到的就是"广告在播、扩展一次都没动手"。
@@ -1089,6 +1105,18 @@
     return mainDur > 0 && isFinite(d) && Math.abs(d - mainDur) > MAIN_DUR_TOLERANCE;
   }
 
+  // ---- v1.4.2：没有 .ad-showing 的广告（现场就是这种）----
+  // v1.3.9 日志里那 970 秒（16 分钟）：`adPlaying= true | .ad-showing= false | 命中数= 0`，
+  // 心跳一直 strong= true —— 说明**有广告覆盖层可见**，可我们的强跳窗口只认
+  // .ad-showing / 广告创意层，于是整段没开窗，用户看到的就是"广告在播、扩展不动手"。
+  // 现在补一条：**YouTube 自己说广告在播**（isAdPlaying() 含 .ad-interrupting /
+  // 可见广告覆盖层）+ **这个 media 已证明不是正片**（notMainClip）→ 就是广告。
+  // 只加后半条不够、只加前半条更危险：单看 isAdPlaying 时 #player-ads 在正片里
+  // 也常驻可见，必须用"时长不是正片"把正片挡在外面。
+  function adPlayingOtherMedia() {
+    return isAdPlaying() && notMainClip(mediaDur());
+  }
+
   // 非广告态持续记录正片时长：广告里若出现"时长≈正片时长"的视频，
   // 说明播放器已经切回正片、只是 .ad-showing 还没来得及摘掉，绝不能跳。
   function recordMainDur() {
@@ -1182,8 +1210,10 @@
     if (now - lastVideoSkip < 700) return false;
     if (now < adEndGuardUntil) return false;   // 广告刚结束，防误判保护窗口
     // [S2] 破坏性操作：默认只认最硬的 .ad-showing；"只有覆盖层"的广告（新版 UI 不挂类名）
-    // 走受限准入 overlayOnlyAd()——广告创意层可见 + 媒体时长是广告量级，两条同时满足才动手。
-    if (!isRealVideoAd() && !overlayOnlyAd()) return false;
+    // 走受限准入 overlayOnlyAd()——广告创意层可见 + 时长不是正片，两条同时满足才动手。
+    // v1.4.2：再加一条 adPlayingOtherMedia()（广告覆盖层可见 + 时长已证明 ≠ 正片），
+    // 现场那 16 分钟就是没有 .ad-showing，前两条都进不去。
+    if (!isRealVideoAd() && !overlayOnlyAd() && !adPlayingOtherMedia()) return false;
 
     const player = document.querySelector('#movie_player, .html5-video-player');
     if (!player) return false;
@@ -1376,6 +1406,11 @@
           dlog('⏩ 长广告强跳：duration=', Math.round(dur * 10) / 10, 's ≠ 正片',
             Math.round(mainDur * 10) / 10, 's，判定为广告（长度不再是拒绝理由）');
         }
+        // v1.4.2：这支推进到结尾后，"正片时长参照"就该作废了 —— 接着上场的是正片
+        // （或下一支广告），若 mainDur 还停在上一支正片而新正片时长又不同，
+        // 下几个 tick 就会把新正片判成"不是正片"推到大结局。
+        // 作废后退回保守一侧：长时长没有参照 → 不推。宁可漏跳一支广告。
+        mainDur = 0;
         dlog('⏩ 视频层强跳：duration=', Math.round(dur * 10) / 10,
           '→ currentTime=', Math.round(v.currentTime * 10) / 10,
           early ? '（起播期 ct=' + (Math.round(ct * 10) / 10) + '，第 ' + earlySeeks + ' 次尝试）' : '');
@@ -1860,6 +1895,11 @@
       setTimeout(scheduleTick, 800);
     };
     document.addEventListener('seeked', seekHandler, true);
+    // v1.4.2：换视频（SPA 导航）时正片时长参照作废。上一支视频的 mainDur 拿去
+    // 判新视频，结论必然是"时长与正片不一致" → 会把新正片推到大结局。
+    // 这是"用 mainDur 当判据"必须配套的清理动作（播放列表连播、点推荐最容易踩）。
+    navHandler = () => { mainDur = 0; };
+    try { document.addEventListener('yt-navigate-finish', navHandler); } catch (_) { /* ignore */ }
     lastTickAt = Date.now();
     tick();
   }

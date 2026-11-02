@@ -786,6 +786,41 @@ function check(name, pass, detail) {
       Math.abs(t - 3.4) < 0.01 && explain >= 1, `ct=${t.toFixed(2)}, 解释行=${explain}`);
   }
 
+  // ---------- AL: 广告在播但没挂 .ad-showing -> 也要强跳（v1.4.2）----------
+  // 现场（v1.3.9 日志前 970 秒 ≈ 16 分钟）：`adPlaying= true | .ad-showing= false |
+  // 命中数= 0`，心跳一直 strong= true（有广告覆盖层可见），可窗口既不看 adPlaying
+  // 也不看这个覆盖层 → 整段没开窗、一次都没动手。用户确认那段时间广告是真的在播。
+  // 这里用 #player-ads（在 AD_OVERLAY 里、不在 AD_FRAME 里）+ 时长已证明 ≠ 正片。
+  {
+    const html = `<div id="movie_player" class="html5-video-player"></div>
+      <div id="player-ads"></div>`;
+    const opts = { duration: 5536, currentTime: 300, paused: false };
+    const video = makeVideo(new JSDOM('').window, opts);
+    const { logs } = await loadPage(html, { video, debug: true });
+    await sleep(700);                        // 非广告态：记下 mainDur = 5536
+    opts.duration = 3225;                    // 换成广告（没有 .ad-showing）
+    video.currentTime = 3.4;
+    await sleep(1800);
+    const t = video.__getTime();
+    check('AL 只有广告覆盖层、没有 ad-showing 的长广告也强跳',
+      t > 3224, `currentTime=${t.toFixed(2)}, 检测=${logs.some((l) => l.indexOf('检测到广告开始') >= 0)}`);
+  }
+
+  // ---------- AM: 覆盖层可见 + 时长就是正片 -> 仍然不动（AL 的安全边界）----------
+  // #player-ads 在正片播放时也常驻可见，单靠 isAdPlaying() 会把正片当广告。
+  // 所以 AL 那条必须叠加"时长 ≠ 正片"，这里验证时长一致时一步都不动。
+  {
+    const html = `<div id="movie_player" class="html5-video-player"></div>
+      <div id="player-ads"></div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 5536, currentTime: 300, paused: false });
+    const { logs } = await loadPage(html, { video, debug: true });
+    await sleep(2000);
+    const t = video.__getTime();
+    check('AM 覆盖层可见但时长等于正片时不动进度',
+      Math.abs(t - 300) < 0.01 && !logs.some((l) => l.indexOf('检测到广告开始') >= 0),
+      `currentTime=${t.toFixed(2)}`);
+  }
+
   const failed = results.filter((r) => !r.pass);
   console.log(`\n共 ${results.length} 项，通过 ${results.length - failed.length}，失败 ${failed.length}`);
   process.exit(failed.length ? 1 : 0);
