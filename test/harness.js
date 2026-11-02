@@ -49,7 +49,7 @@ function makeChrome(init) {
     },
   });
   return {
-    runtime: { id: 'test-ext', lastError: undefined, getManifest: () => ({ version: '1.3.1' }) },
+    runtime: { id: 'test-ext', lastError: undefined, getManifest: () => ({ version: '1.3.2' }) },
     storage: {
       sync: area(sync, 'sync'),
       local: area(local, 'local'),
@@ -373,6 +373,28 @@ function check(name, pass, detail) {
     check('O 广告 pod 第二支不被上一支的点击冷却挡住',
       firstAdClicks > 0 && secondAdClicks > 0,
       `第1支 clicks=${firstAdClicks}, 第2支 clicks=${secondAdClicks}`);
+  }
+
+  // ---------- P: pod 两支广告且全程不摘 ad-showing（现场日志形态）----------
+  // 真实日志里 15s → 36s 两支广告只记了"第 1 次"，说明 .ad-showing 没切换过，
+  // v1.3.1 靠 adEpoch 的重置不会触发。这种形态只能靠"被跳的视频时长变了"认出下一支。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing">
+        <button id="qb" class="ytp-skip-ad-button">跳过</button>
+      </div>`;
+    const opts = { duration: 15, currentTime: 1, paused: false };
+    const video = makeVideo(new JSDOM('').window, opts);
+    const { win } = await loadPage(html, { video });
+    let clicks = 0;
+    win.document.querySelector('#qb').addEventListener('click', () => { clicks += 1; });
+    await sleep(1300);                       // 第一支：点击已落地、且已被视频层强跳
+    const afterFirst = clicks;
+    opts.duration = 36;                      // 第二支广告：时长变了，但仍是同一个 <video>
+    video.currentTime = 1;
+    await sleep(1800);
+    check('P pod 不摘 ad-showing 时第二支仍能点击',
+      afterFirst > 0 && clicks > afterFirst,
+      `第1支 clicks=${afterFirst}，累计 clicks=${clicks}`);
   }
 
   const failed = results.filter((r) => !r.pass);

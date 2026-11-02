@@ -80,6 +80,14 @@
  *  - 点击冷却（lastClickMap）与跳转间隔（videoSkipTimes）是按元素记的 WeakMap，
  *    pod 内 YouTube 复用同一批 DOM 节点 / 同一个 <video>，上一支的 3.5s 冷却会
  *    整个挡到下一支。现在每次新广告开始（adEpoch+1）都重置这三处状态
+ *
+ * v1.3.2：pod 的第二种形态 + 日志假读数
+ *  - 现场日志里 15s → 36s 两支广告只记了"第 1 次"，说明 pod 内 .ad-showing
+ *    并未切换，v1.3.1 靠 adEpoch 的重置根本不会触发。补一条判据：被强跳的
+ *    视频时长变了就视为"换了一支"，同样重置按元素的状态
+ *  - 拒绝日志里的 text 恒为空是假象：v1.2.7 起 visibleText 对不可见元素直接
+ *    返回空，而 0×0 按钮恰恰不可见。日志改用 elementText（原始 textContent +
+ *    aria-label），否则永远看不出这个按钮到底有没有"跳过"文案
  */
 (() => {
   'use strict';
@@ -90,7 +98,7 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.3.1'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.3.2'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
@@ -685,6 +693,7 @@
   let rateBoostPrev = 1;         // 加速前的原速率（用户本来可能就在 2×）
   let endStallSince = 0;         // 广告贴在尾部不动的起始时间戳（0 = 未卡住）
   let videoSkipTimes = new WeakMap();   // video -> 上次跳转时间（同样按广告重置）
+  let lastJumpDur = 0;                  // 上一次强跳的视频时长，用于认出 pod 里的下一支
 
   // 广告结束后把播放速度还原，别把正片也加速了
   function releaseRateBoost() {
@@ -712,6 +721,15 @@
     // 代价：广告起播瞬间若还没挂上广告标记，可能把广告时长误记成正片，
     // 之后同长度的广告会被放过一次——"漏跳一次"远好于"把正片跳到大结局"。
     if (isFinite(d) && d > 1 && !v.paused) mainDur = d;
+  }
+
+  // 广告边界：清掉"按元素"记录的点击/跳转状态。
+  // pod 内 YouTube 复用同一批 DOM 节点和同一个 <video>，这些状态若不重置，
+  // 上一支的 3.5s 点击冷却会整个盖到下一支头上。
+  function resetAdScopedState() {
+    lastClickMap = new WeakMap();
+    pendingSet = new WeakSet();
+    videoSkipTimes = new WeakMap();
   }
 
   function forceSkipAdViaVideo() {
@@ -788,6 +806,13 @@
       videoSkipTimes.set(v, now);
       lastVideoSkip = now;
       try {
+        // 认出"换了一支广告"的第二种形态：pod 里 YouTube 有时不切换 .ad-showing，
+        // adEpoch 就不 +1（现场日志 15s → 36s 两支只记了"第 1 次"）。
+        // 这时只能靠"被跳的视频时长变了"来判断，否则上一支的点击冷却会盖住下一支。
+        if (dur !== lastJumpDur) {
+          lastJumpDur = dur;
+          resetAdScopedState();
+        }
         jumpTarget = Math.max(0, dur - 0.05);
         jumpEl = v;
         jumpDur = dur;
@@ -949,7 +974,7 @@
             '| countdown=', inCountdown(node),
             '| mini=', inMiniPlayer(node),
             '| rect=', (() => { const r = node.getBoundingClientRect(); return Math.round(r.width) + 'x' + Math.round(r.height); })(),
-            '| text=', JSON.stringify(visibleText(node).slice(0, 30)),
+            '| text=', JSON.stringify(elementText(node).slice(0, 30)),
             '| cls=', node.className && String(node.className).slice(0, 60));
         }
       }
@@ -1079,9 +1104,8 @@
         // 广告 pod 里 YouTube 会复用同一批 DOM 节点和同一个 <video>：
         // 上一支的点击冷却（3.5s）、跳转间隔（0.9s）若跨到下一支，第二支就会被
         // 白白挡几秒，用户看到的仍是"点了但慢半拍"。每次新广告开始都重置。
-        lastClickMap = new WeakMap();
-        pendingSet = new WeakSet();
-        videoSkipTimes = new WeakMap();
+        resetAdScopedState();
+        lastJumpDur = 0;
         dlog('📺 检测到广告开始（第', adEpoch, '次）');
       }
     } else {
