@@ -49,7 +49,7 @@ function makeChrome(init) {
     },
   });
   return {
-    runtime: { id: 'test-ext', lastError: undefined, getManifest: () => ({ version: '1.3.0' }) },
+    runtime: { id: 'test-ext', lastError: undefined, getManifest: () => ({ version: '1.3.1' }) },
     storage: {
       sync: area(sync, 'sync'),
       local: area(local, 'local'),
@@ -342,6 +342,37 @@ function check(name, pass, detail) {
     win.document.querySelector('#hb').addEventListener('click', () => { clicks += 1; });
     await sleep(900);
     check('N 0×0 且 display:none 的按钮不点击', clicks === 0, `clicks=${clicks}`);
+  }
+
+  // ---------- O: 广告 pod（连播两支）复用同一 DOM 节点 -> 第二支不被上一支冷却挡住 ----------
+  // 现场日志里出现过 30.1s + 39.7s 连续两支广告。YouTube 在 pod 内复用同一个
+  // .ytp-skip-ad-button 节点，而点击冷却（3.5s）是按元素记的，不重置就会把
+  // 第二支的点击挡掉一大截。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing">
+        <button id="pb" class="ytp-skip-ad-button ytp-ad-skip-button-modern">跳过</button>
+      </div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 20, currentTime: 1, paused: true });
+    const { win } = await loadPage(html, { video });
+    const times = [];
+    const player = win.document.querySelector('#movie_player');
+    const btn = win.document.querySelector('#pb');
+    btn.addEventListener('click', () => times.push(Date.now()));
+    await sleep(650);                                     // 第一支广告：点击已落地
+    const firstAdClicks = times.length;
+    // 第一支结束。注意 .ytp-ad-skip-button-modern 本身就是强广告信号，
+    // 只摘 ad-showing 不足以让广告态退出 —— 必须把按钮移出文档。
+    player.className = 'html5-video-player';
+    btn.remove();
+    await sleep(300);
+    const secondAdStart = Date.now();
+    player.className = 'html5-video-player ad-showing';   // 第二支开始
+    player.appendChild(btn);                              // 复用同一个节点对象
+    await sleep(700);
+    const secondAdClicks = times.filter((t) => t >= secondAdStart).length;
+    check('O 广告 pod 第二支不被上一支的点击冷却挡住',
+      firstAdClicks > 0 && secondAdClicks > 0,
+      `第1支 clicks=${firstAdClicks}, 第2支 clicks=${secondAdClicks}`);
   }
 
   const failed = results.filter((r) => !r.pass);

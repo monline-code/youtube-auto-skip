@@ -75,6 +75,11 @@
  *    语义以文案/aria-label 为准，避免 0×0 空壳（无文本、点了没用）挤掉真按钮
  *  - pickBest 平局规则：同等语义下优先有尺寸的目标，避免点到 0×0 空壳
  *  - 点击前随机延迟 300–900ms → 150–400ms（仅为避开同帧竞态）
+ *
+ * v1.3.1：广告 pod（连播）里第二支"慢半拍"
+ *  - 点击冷却（lastClickMap）与跳转间隔（videoSkipTimes）是按元素记的 WeakMap，
+ *    pod 内 YouTube 复用同一批 DOM 节点 / 同一个 <video>，上一支的 3.5s 冷却会
+ *    整个挡到下一支。现在每次新广告开始（adEpoch+1）都重置这三处状态
  */
 (() => {
   'use strict';
@@ -85,7 +90,7 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.3.0'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.3.1'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
@@ -153,8 +158,10 @@
   let debug = false;                  // 调试日志开关
   let destroyed = false;              // 扩展上下文失效后自我销毁标记
   let started = false;                // 主循环是否已启动（幂等）
-  const lastClickMap = new WeakMap(); // el -> timestamp
-  const pendingSet = new WeakSet();   // 已排队等待点击的元素
+  // 这两个是"按元素"的点击状态。广告 pod（连播两支）里 YouTube 会复用同一批
+  // DOM 节点，所以它们在每支广告开始时要重置，否则上一支的冷却会挡住下一支。
+  let lastClickMap = new WeakMap(); // el -> timestamp
+  let pendingSet = new WeakSet();   // 已排队等待点击的元素
 
   // 单次 tick 内的可见性 / 文本缓存：同一元素会在 pickBest、inCountdown、
   // deepFindSkipButton 里被反复询问，重复算样式极其浪费。
@@ -677,7 +684,7 @@
   let rateBoostEl = null;        // 被我们加速过的 video 元素
   let rateBoostPrev = 1;         // 加速前的原速率（用户本来可能就在 2×）
   let endStallSince = 0;         // 广告贴在尾部不动的起始时间戳（0 = 未卡住）
-  const videoSkipTimes = new WeakMap();
+  let videoSkipTimes = new WeakMap();   // video -> 上次跳转时间（同样按广告重置）
 
   // 广告结束后把播放速度还原，别把正片也加速了
   function releaseRateBoost() {
@@ -1069,6 +1076,12 @@
         jumpEl = null;
         jumpDur = 0;
         endStallSince = 0;
+        // 广告 pod 里 YouTube 会复用同一批 DOM 节点和同一个 <video>：
+        // 上一支的点击冷却（3.5s）、跳转间隔（0.9s）若跨到下一支，第二支就会被
+        // 白白挡几秒，用户看到的仍是"点了但慢半拍"。每次新广告开始都重置。
+        lastClickMap = new WeakMap();
+        pendingSet = new WeakSet();
+        videoSkipTimes = new WeakMap();
         dlog('📺 检测到广告开始（第', adEpoch, '次）');
       }
     } else {
