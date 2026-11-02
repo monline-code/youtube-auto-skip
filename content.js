@@ -88,6 +88,19 @@
  *  - 拒绝日志里的 text 恒为空是假象：v1.2.7 起 visibleText 对不可见元素直接
  *    返回空，而 0×0 按钮恰恰不可见。日志改用 elementText（原始 textContent +
  *    aria-label），否则永远看不出这个按钮到底有没有"跳过"文案
+ *
+ * v1.3.3：把"看得见按钮、广告还在播"剩下的几处来源逐个掐掉
+ *  - [日志] 每条 dlog 带相对时间戳（+1234ms）。之前只能按行序猜时序，
+ *    分不清"200ms 内完成"和"卡了 6 秒"，体感延迟无法量化
+ *  - [点击] 0×0 按钮的点击目标升级到"文案仍纯粹是跳过、且有真实布局盒"的祖先：
+ *    无布局盒的元素上 el.click() 常是空操作（日志里点了但广告不结束）
+ *  - [可见性] visibility 只认元素自身的 computed 值。它是可继承也可被后代覆盖的，
+ *    祖先 visibility:hidden 被子元素改回 visible 时，旧实现会永久判成不可见
+ *  - [冷却] 点击冷却改为"当前广告作用域内有效"：同支内不重复点，跨支立即解禁
+ *    （日志里同一支广告出现了两次"准备点击"）
+ *  - [节奏] 强跳不再统一等 800ms：能证明"时长相较正片明显不同"时就立刻动手，
+ *    只有 mainDur 还没有参照值（打开链接先播广告）时才保留 800ms 确认窗口
+ *  - 拒绝日志补 cssHidden 字段，把"0×0"和"被 CSS 判隐藏"区分开
  */
 (() => {
   'use strict';
@@ -98,7 +111,7 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.3.2'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.3.3'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
@@ -168,8 +181,9 @@
   let started = false;                // 主循环是否已启动（幂等）
   // 这两个是"按元素"的点击状态。广告 pod（连播两支）里 YouTube 会复用同一批
   // DOM 节点，所以它们在每支广告开始时要重置，否则上一支的冷却会挡住下一支。
-  let lastClickMap = new WeakMap(); // el -> timestamp
+  let lastClickMap = new WeakMap(); // el -> { t: 时间戳, seq: 广告作用域序号 }
   let pendingSet = new WeakSet();   // 已排队等待点击的元素
+  let adScopedSeq = 0;              // 每进入一支新广告 +1，用于让点击冷却"跨支失效、同支有效"
 
   // 单次 tick 内的可见性 / 文本缓存：同一元素会在 pickBest、inCountdown、
   // deepFindSkipButton 里被反复询问，重复算样式极其浪费。
@@ -233,8 +247,11 @@
 
   // 调试日志：chrome.storage.sync.set({debug:true}) 打开，set({debug:false}) 关闭。
   // 也可在扩展弹窗里勾选「调试日志」。
+  // v1.3.3：每条日志带"相对页面加载的毫秒数"。之前排查全靠 console 行序猜时序，
+  // 分不清"200ms 内完成"和"卡了 6 秒"——加了时间戳才能把体感延迟量化。
+  const LOG_T0 = Date.now();
   function dlog(...args) {
-    if (debug) console.log('[YT-AutoSkip]', ...args);
+    if (debug) console.log('[YT-AutoSkip] +' + (Date.now() - LOG_T0) + 'ms', ...args);
   }
 
   // 节流版调试日志：同一 key 每 3s 最多打印一次，避免广告期间刷屏
@@ -312,13 +329,22 @@
   // 只看 CSS 是否隐藏（display/visibility/opacity，含祖先，跨 shadow 边界），不看尺寸。
   // v1.2.8：祖先链跨 shadow 边界继续（宿主的 display:none 会隐藏整棵影子树，
   // 而 parentElement 到 shadow root 就断了，会漏判成"可见"）。
+  // v1.3.3：visibility 只认元素自身的 computed 值。visibility 可继承也可被后代覆盖，
+  // 元素自身的 getComputedStyle 已经是最终结论；祖先的 visibility:hidden 若被后代
+  // 改回 visible，祖先那一条不能再算隐藏（旧实现会把这种按钮永久判成不可见）。
+  // display:none / opacity:0 仍是"祖先隐藏 = 整棵子树隐藏"，必须继续沿祖先链检查。
   function isCssHidden(el) {
     let node = el;
     let depth = 0;
+    let isSelf = true;
     while (node && depth++ < 40) {
       let st = null;
       try { st = getComputedStyle(node); } catch (_) { st = null; }
-      if (st && (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0')) return true;
+      if (st) {
+        if (st.display === 'none' || st.opacity === '0') return true;
+        if (isSelf && st.visibility === 'hidden') return true;
+      }
+      isSelf = false;
       let p = node.parentElement;
       if (!p) {
         let root = null;
@@ -459,13 +485,52 @@
   }
 
   function isCoolingDown(el) {
-    const t = lastClickMap.get(el);
-    return t && Date.now() - t < RECLICK_COOLDOWN;
+    const rec = lastClickMap.get(el);
+    // 只认"当前这支广告里"的点击。pod 换支时 seq 变化 → 冷却自动失效；
+    // 同一支里重复命中同一元素 → 冷却继续生效，不会几百毫秒连点好几次。
+    return !!rec && rec.seq === adScopedSeq && Date.now() - rec.t < RECLICK_COOLDOWN;
+  }
+
+  // v1.3.3：0×0 的跳过按钮，点击目标要"升级"到真正有布局盒的外壳。
+  // 现场日志：rect= 0x0、text= "跳过"，点击后广告没有立刻结束。没有布局盒的元素上
+  // el.click() 常常是空操作——YouTube 的命中测试按几何盒子走。
+  // 约束（很容易踩坑）：只接受"外壳类名含 skip 或 role=button"的祖先，且文案仍纯粹
+  // 是跳过。否则会一路爬到 #movie_player 上——那等于点了播放器空白处，纯浪费一次点击
+  // （实测测试 L 就是这样退化成 clicks=0 的）。
+  function resolveClickableBox(el) {
+    if (!el) return el;
+    const r0 = el.getBoundingClientRect();
+    if (r0.width > 0 && r0.height > 0) return el;
+    let node = el.parentElement;
+    let depth = 0;
+    while (node && depth++ < 3) {
+      const cn = classOf(node);
+      const isShell = /skip/i.test(cn) ||
+        (node.getAttribute && node.getAttribute('role') === 'button');
+      if (!isShell) return el;
+      if (node.matches && node.matches('#movie_player, .html5-video-player')) return el;
+      const t = elementText(node);
+      if (!t || t.length > 40 || !SKIP_TEXT_RE.test(t) || BAD_TEXT_RE.test(t)) return el;
+      if (isCssHidden(node)) return el;
+      const r = node.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) {
+        if (!isSafeClickTarget(node)) return el;
+        return node;
+      }
+      node = node.parentElement;
+    }
+    return el;
   }
 
   function clickElement(el) {
-    lastClickMap.set(el, Date.now());
+    lastClickMap.set(el, { t: Date.now(), seq: adScopedSeq });
+    const original = el;
+    el = resolveClickableBox(el);
     const rect = el.getBoundingClientRect();
+    dlog('🖱️ 实际点击:', (el.tagName || '').toLowerCase(),
+      '| rect=', Math.round(rect.width) + 'x' + Math.round(rect.height),
+      '| 升级到祖先=', el !== original,
+      '| cls=', classOf(el).slice(0, 60));
     // 0 尺寸节点（如 YouTube 为兼容保留的隐藏 .ytp-skip-ad-button 壳）：
     // 不能用 (0,0) 坐标派发鼠标事件（可能命中无关位置），只发原生 click()。
     if (rect.width <= 0 || rect.height <= 0) {
@@ -496,6 +561,8 @@
       } catch (_) { /* ignore */ }
     }
     try { el.click(); } catch (_) { /* ignore */ }
+    // 升级到外壳时，原 0×0 按钮上也可能挂着 YouTube 的处理函数，补一次原生点击
+    if (el !== original) { try { original.click(); } catch (_) { /* ignore */ } }
   }
 
   function humanDelay() {
@@ -680,6 +747,8 @@
   // 这条路径绕开"按钮找不到 / 按钮是空壳 / shadow 点击无效"的所有问题，
   // 是保证"一定有跳过动作"的最后一道保险。
   const AD_MAX_DURATION = 300;   // 只处理 ≤5 分钟的片子（广告），先把长视频排除
+  const AD_SKIP_MIN_WAIT = 200;    // 广告标记出现后至少等这么久再动手（等播放器把 video 挂上）
+  const AD_SKIP_CONFIRM_MS = 800;  // 无法证明"不是正片"时（mainDur 未知）必须等满的确认窗口
   const VIDEO_SKIP_GAP = 900;    // 同一 video 元素最小间隔
   const END_STALL_MS = 3000;     // 贴到结尾却迟迟不结束时，多久后改用加速
   let lastVideoSkip = 0;
@@ -727,7 +796,7 @@
   // pod 内 YouTube 复用同一批 DOM 节点和同一个 <video>，这些状态若不重置，
   // 上一支的 3.5s 点击冷却会整个盖到下一支头上。
   function resetAdScopedState() {
-    lastClickMap = new WeakMap();
+    adScopedSeq += 1;                 // 让上一支的点击冷却整体失效（不必重建 WeakMap）
     pendingSet = new WeakSet();
     videoSkipTimes = new WeakMap();
   }
@@ -768,6 +837,11 @@
         dlogReject('maindur', '⏩ 时长与正片一致（', Math.round(dur * 10) / 10, 's），判定为正片，不动进度');
         continue;
       }
+      // v1.3.3：能证明"这个 video 不是正片"（时长与 mainDur 明显不同）时立刻动手，
+      // 不再统一等 800ms——那 0.8 秒是用户"看得见按钮、广告还在播"的主要来源。
+      // 证明不了（mainDur 还没记到，例如"打开链接先播广告"）时保留确认窗口，
+      // 否则可能把正片当广告推到片尾，这个风险不值得省那 0.8 秒。
+      if (!(mainDur > 0) && now - adStateSince < AD_SKIP_CONFIRM_MS) continue;
 
       const t = videoSkipTimes.get(v);
       if (t && now - t < VIDEO_SKIP_GAP) continue;
@@ -970,6 +1044,7 @@
         if (debug) {
           dlogReject(sel, '选择器命中但被拒:', sel,
             '| vis=', isVisible(node),
+            '| cssHidden=', isCssHidden(node),
             '| disabled=', isDisabled(node),
             '| countdown=', inCountdown(node),
             '| mini=', inMiniPlayer(node),
@@ -1125,10 +1200,10 @@
       recordMainDur();
     }
 
-    // 【主力】广告播放满 0.8s 就直接把广告视频推到结尾。
-    // 实测（用户日志）大量广告根本没有可见的"跳过"按钮，DOM 里只有一个
-    // 0×0 的空壳 .ytp-skip-ad-button，点击路径对它们永远无效——只有这条能用。
-    if (adStateSince && Date.now() - adStateSince >= 800) {
+    // 【主力】广告一开始就把广告视频推到结尾。
+    // v1.3.3：外层只挡"广告标记刚挂上的那一两帧"，细粒度确认窗口挪进
+    // forceSkipAdViaVideo —— 只有拿到 video 的 duration 才能证明"它不是正片"。
+    if (adStateSince && Date.now() - adStateSince >= AD_SKIP_MIN_WAIT) {
       forceSkipAdViaVideo();
     }
 

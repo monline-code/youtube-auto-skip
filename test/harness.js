@@ -49,7 +49,7 @@ function makeChrome(init) {
     },
   });
   return {
-    runtime: { id: 'test-ext', lastError: undefined, getManifest: () => ({ version: '1.3.2' }) },
+    runtime: { id: 'test-ext', lastError: undefined, getManifest: () => ({ version: require('../manifest.json').version }) },
     storage: {
       sync: area(sync, 'sync'),
       local: area(local, 'local'),
@@ -395,6 +395,67 @@ function check(name, pass, detail) {
     check('P pod 不摘 ad-showing 时第二支仍能点击',
       afterFirst > 0 && clicks > afterFirst,
       `第1支 clicks=${afterFirst}，累计 clicks=${clicks}`);
+  }
+
+  // ---------- Q: 已知正片时长且与广告不同 -> 不再统一等 800ms ----------
+  // v1.3.3：原来 tick 里写死"广告态满 800ms 才强跳"，用户体感就是"广告先播一秒"。
+  // 现在只要能证明"这个 video 不是正片"（时长与 mainDur 明显不同）就立刻动手。
+  {
+    const html = `<div id="movie_player" class="html5-video-player"></div>`;
+    const opts = { duration: 600, currentTime: 120, paused: false };
+    const video = makeVideo(new JSDOM('').window, opts);
+    const { win, player, logs } = await loadPage(html, { video, debug: true });
+    await sleep(700);                       // 先让 mainDur 记到 600（非广告态）
+    opts.duration = 15;                     // 切广告
+    video.currentTime = 0.5;
+    player.classList.add('ad-showing');
+    await sleep(1600);
+    // 用日志里的相对时间戳量"从认出广告到真的强跳"的间隔，比按墙钟取整更稳
+    const stamp = (re) => {
+      for (const line of logs) {
+        const m = new RegExp(re + '.*?\\+(\\d+)ms').exec(String(line)) ||
+                  new RegExp('\\+(\\d+)ms.*?' + re).exec(String(line));
+        if (m) return Number(m[1]);
+      }
+      return -1;
+    };
+    const tAd = stamp('检测到广告开始');
+    const tJump = stamp('视频层强跳');
+    const delta = tAd >= 0 && tJump >= 0 ? tJump - tAd : -1;
+    check('Q mainDur 已知时广告不再等 800ms 才强跳',
+      delta >= 0 && delta <= 450,
+      `认广告 +${tAd}ms → 强跳 +${tJump}ms（间隔 ${delta}ms）`);
+  }
+
+  // ---------- R: mainDur 未知（打开链接先播广告）-> 仍保留 800ms 确认窗口 ----------
+  // 这是 Q 的安全边界：证明不了"不是正片"时不能省这 0.8 秒，
+  // 否则可能把正片当成广告推到片尾。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 15, currentTime: 0.5, paused: false });
+    const { win } = await loadPage(html, { video });
+    await sleep(500);
+    const early = win.document.querySelector('video').__getTime();
+    await sleep(800);
+    const late = win.document.querySelector('video').__getTime();
+    check('R mainDur 未知时保留 800ms 确认窗口',
+      early < 14 && late > 14, `500ms 时=${early.toFixed(2)}, 1300ms 时=${late.toFixed(2)}`);
+  }
+
+  // ---------- S: 0×0 按钮 + 有尺寸的外壳 -> 点击升级到外壳 ----------
+  // 没有布局盒的元素上 el.click() 常是空操作，YouTube 的命中测试按几何盒子走。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing">
+        <div id="sh" class="ytp-ad-skip-button-container">
+          <button id="sb" class="ytp-skip-ad-button">跳过</button>
+        </div>
+      </div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 15, currentTime: 0.5, paused: true });
+    const { win } = await loadPage(html, { video, zeroRect: '#sb' });
+    let shellClicks = 0;
+    win.document.querySelector('#sh').addEventListener('click', () => { shellClicks += 1; });
+    await sleep(900);
+    check('S 0×0 按钮的点击升级到有尺寸的外壳', shellClicks > 0, `shell clicks=${shellClicks}`);
   }
 
   const failed = results.filter((r) => !r.pass);
