@@ -24,7 +24,8 @@ try {
 }
 
 const EXT_DIR = path.join(__dirname, '..');
-const CODE = fs.readFileSync(path.join(EXT_DIR, 'content.js'), 'utf8');
+// YT_CONTENT 可指向另一份 content.js，用于回归对比（如验证某条防护是否真的起作用）
+const CODE = fs.readFileSync(process.env.YT_CONTENT || path.join(EXT_DIR, 'content.js'), 'utf8');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function makeChrome(init) {
@@ -48,7 +49,7 @@ function makeChrome(init) {
     },
   });
   return {
-    runtime: { id: 'test-ext', lastError: undefined, getManifest: () => ({ version: '1.2.8' }) },
+    runtime: { id: 'test-ext', lastError: undefined, getManifest: () => ({ version: '1.2.9' }) },
     storage: {
       sync: area(sync, 'sync'),
       local: area(local, 'local'),
@@ -84,7 +85,7 @@ function makeVideo(win, opts) {
   return v;
 }
 
-async function loadPage(html, { video, enabled = true, debug = false } = {}) {
+async function loadPage(html, { video, enabled = true, debug = false, stub } = {}) {
   const dom = new JSDOM(`<!DOCTYPE html><body>${html}</body>`, {
     runScripts: 'outside-only',
     pretendToBeVisual: true,
@@ -102,6 +103,7 @@ async function loadPage(html, { video, enabled = true, debug = false } = {}) {
   if (debug) {
     win.console.log = (...a) => { logs.push(a.map(String).join(' ')); };
   }
+  if (stub) stub(win);
   win.eval(CODE);
   await sleep(60);   // 等 storage 回调 -> start()
   return { win, chrome: win.chrome, player, logs };
@@ -278,6 +280,32 @@ function check(name, pass, detail) {
     shadow.appendChild(btn);
     await sleep(3500);
     check('J shadow 宿主为广告创意区时仍不点击', clicks === 0, `clicks=${clicks}`);
+  }
+
+  // ---------- K: 延迟点击期间广告结束、且期间没有 tick -> 仍不得点击（S1 + force）----------
+  // 用例 3 之所以能拦住，是因为广告 DOM 被移除了（元素脱离文档）。这里保留按钮可见，
+  // 只做"广告结束"这一件事，并用两个桩隔离变量：
+  //   - MutationObserver 置空：广告结束不再触发即时重扫，制造"两次 tick 之间"的窗口
+  //   - Math.random 固定为 0：点击延迟恒为 300ms，早于 600ms 的兜底轮询
+  // 于是回调里的 adStateStrong() 只能读到上一次 tick 的结论（true）。若不复算，就会点击。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing">
+        <div class="ytp-skip-ad-button" id="kb">跳过广告</div>
+      </div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 15, currentTime: 0.5, paused: true });
+    const { win, player } = await loadPage(html, {
+      video,
+      stub: (w) => {
+        w.MutationObserver = class { observe() {} disconnect() {} takeRecords() { return []; } };
+        w.Math.random = () => 0;
+      },
+    });
+    let clicks = 0;
+    win.document.querySelector('#kb').addEventListener('click', () => { clicks += 1; });
+    await sleep(100);                      // 首次 tick 已把点击排入队列（300ms 后执行）
+    player.className = 'html5-video-player';   // 广告结束：按钮仍在、依旧可见
+    await sleep(700);
+    check('K 延迟点击期间广告已结束则不点击', clicks === 0, `clicks=${clicks}`);
   }
 
   const failed = results.filter((r) => !r.pass);

@@ -62,6 +62,10 @@
  *    shadow root 内节点恒为 false，深度扫描（专为影子树按钮而写）命中后一律被丢弃
  *  - isVisible 的祖先链跨 shadow 边界：宿主 display:none 时不再误判为可见
  *  - 新增 closestDeep()：影子树内的节点也能正确判断是否在迷你播放器里
+ *
+ * v1.2.9：S1 复检不再读过期缓存
+ *  - adStateStrong(force)：延迟点击回调发生在两次 tick 之间，缓存里是上一次
+ *    扫描的结论（广告已结束仍判为 true），TOCTOU 复检会形同虚设；复检处强制重算
  */
 (() => {
   'use strict';
@@ -72,7 +76,7 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.2.8'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.2.9'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
@@ -501,7 +505,8 @@
       // 跳过按钮还要求仍在强广告态（requireAd），否则点一个已失效/被复用的节点
       // 可能误触广告主落地页——这正是 v1.2.3「弹窗」问题的复发路径。
       if (!isSafeClickTarget(el)) return;
-      if (requireAd && !adStateStrong()) return;
+      // 强制重算广告态：这里已经跨出 tick 了，读缓存可能拿到上一次扫描的旧结论
+      if (requireAd && !adStateStrong(true)) return;
       clickElement(el);
       if (onDone) onDone();
     }, humanDelay());
@@ -571,23 +576,28 @@
     '.ytp-ad-duration-remaining',
   ];
 
-  function adStateStrong() {
+  function computeAdState() {
+    const p = document.querySelector('#movie_player, .html5-video-player');
+    if (p && p.classList && p.classList.contains('ad-showing')) return true;
+    if (document.querySelector('.ad-showing')) return true;
+    // 新版广告 UI 有时不挂 ad-showing，靠广告独有覆盖层判定
+    for (const sel of STRONG_AD_SELECTORS) {
+      let el = null;
+      try { el = document.querySelector(sel); } catch (_) { el = null; }
+      if (el && isVisible(el)) return true;
+    }
+    return false;
+  }
+
+  // force=true：跳过缓存重新判定。用于"延迟点击回调"这类跨 tick 的复检——
+  // 缓存只在 tick 开头失效，而调用可能发生在两次 tick 之间，读到的是上一次
+  // 扫描的结论（广告已结束却仍判为 true，S1 的 TOCTOU 复检就形同虚设）。
+  function adStateStrong(force) {
     // [P2] 单 tick 内缓存：tick 开头会清空 adStateCache，
     // 同一次 tick 里 findSkipButton / forceSkipAdViaVideo / emitDebugBeat
     // 多次调用只计算一次（含多次 querySelector + isVisible），省下重复开销。
-    if (adStateCache !== undefined) return adStateCache;
-    const result = (function computeAdState() {
-      const p = document.querySelector('#movie_player, .html5-video-player');
-      if (p && p.classList && p.classList.contains('ad-showing')) return true;
-      if (document.querySelector('.ad-showing')) return true;
-      // 新版广告 UI 有时不挂 ad-showing，靠广告独有覆盖层判定
-      for (const sel of STRONG_AD_SELECTORS) {
-        let el = null;
-        try { el = document.querySelector(sel); } catch (_) { el = null; }
-        if (el && isVisible(el)) return true;
-      }
-      return false;
-    })();
+    if (!force && adStateCache !== undefined) return adStateCache;
+    const result = computeAdState();
     adStateCache = result;
     return result;
   }
