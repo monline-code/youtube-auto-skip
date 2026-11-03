@@ -236,6 +236,22 @@
  *    "没有参照的长媒体"改用 AD_UNKNOWN_EXIT_MS（120s）这个安全阀
  *  - [改动] `yt-navigate-finish` 只在 video id 真的变了才作废 mainDur
  *  - [改动] 删掉"冷却/排队中"那条日志（预算用完已有 🛑，冷却期写出来只是噪音）
+ *
+ * v1.4.5：让"正片时长参照"真的能拿到（v1.4.4 的兜底实际没生效）
+ *  - [事实] 现场日志（v1.4.4，68 行）里 `🎯 正片时长参照取自页面元数据` 一次都没出现，
+ *    而进广告那一 tick `mainDur= 未知` —— 说明 `<meta itemprop="duration">` 在那一刻
+ *    根本不在页面里。兜底只在测试里成立，现场等于没写。好消息是那两段 pod 的广告
+ *    都是 15~60s，走"起播期直接贴尾 seek"，没有参照也照样跳掉了（8.3s / 7.0s 全清）
+ *  - [改动] 参照加来源 2：页面内联脚本里的 ytInitialPlayerResponse.videoDetails
+ *    （`lengthSeconds` + `videoId` 校验归属，首屏 HTML 就带着）
+ *  - [改动] 读不到**不再记成永久答案**：一次 miss 曾让这支视频的所有广告都拿不到
+ *    参照（预播广告时页面 metadata 常没渲染），改成 3s 退避重试
+ *  - [改动] 无参照的超长媒体不再一句 🚫 就永久放弃：边播边等，参照一到位立刻重判
+ *  - [改动] 先读调试开关再启动主循环：页面刚加载的那次 tick 早于 debug 读回来，
+ *    "打开链接先播广告"最关键的前几行（📺 / 🎯）以前全被丢掉
+ *  - [日志] 心跳补 `覆盖层=`（是哪几个元素把 `strong` 撑成 true 的）。
+ *    v1.4.4 日志里连续 322 秒 `strong=true | adPlaying=true | .ad-showing=false`，
+ *    当时只能猜是 `#player-ads` 常驻横幅 —— 猜的东西不该留在脑子里
  */
 (() => {
   'use strict';
@@ -246,7 +262,7 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.4.4'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.4.5'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
@@ -1170,6 +1186,7 @@
   //   notMainClip(d)  → 已证明不是正片（时长差得很远），多长都可以跳
   // mainDur 还是 0（打开链接就先播广告）时两者都 false —— 没有参照就别动进度。
   const MAIN_DUR_TOLERANCE = 2;   // 秒。正片时长有小数/取整差异，留 2s 余量
+  const MAIN_DUR_RETRY_MS = 3000; // v1.4.5：读不到正片参照时的重试间隔（miss 不缓存）
   function mainClipLike(d) {
     return mainDur > 0 && isFinite(d) && Math.abs(d - mainDur) <= MAIN_DUR_TOLERANCE;
   }
@@ -1204,22 +1221,76 @@
   }
 
   let mainDurId = '';       // mainDur 是在哪个视频上测到的（换视频才作废）
-  let metaDurId = null;     // 下面这份元数据时长是在哪个视频上读的
+  let metaDurId = null;     // 下面这份页面时长是在哪个视频上读的
   let metaDur = 0;
-  // 拿页面元数据里的正片时长（读不到 NaN）。只在"视频 id 与当前 URL 一致"时采用，
-  // 否则换视频的瞬间可能读到上一支的时长，反过来把新正片判成广告。
-  function mainDurFromPage() {
-    const id = pageVideoId();
-    if (!id) return NaN;
-    if (metaDurId === id) return metaDur || NaN;
-    let d = NaN;
+  let metaDurSrc = '';      // 读成功时用的哪个来源（写进日志，别让人再猜）
+  let metaDurTryAt = 0;     // 上次尝试读取的时间（读不到也不许记成永久答案）
+
+  // 来源 1：`<meta itemprop="duration" content="PT16M14.6S">`（ISO 8601）
+  function durFromMeta() {
     try {
       const el = document.querySelector('meta[itemprop="duration"]');
-      if (el) d = parseIsoDuration(el.getAttribute('content'));
-    } catch (_) { d = NaN; }
+      return el ? parseIsoDuration(el.getAttribute('content')) : NaN;
+    } catch (_) { return NaN; }
+  }
+
+  // 来源 2：页面内联脚本里的 ytInitialPlayerResponse.videoDetails。
+  // 现场（v1.4.4 日志，68 行）证明来源 1 靠不住：预播广告进广告那一刻页面里根本没有
+  // 那行 meta，`🎯` 一次都没打出来 —— 兜底等于没写。
+  // playerResponse 首屏 HTML 就带着，但它描述的是**首屏那支视频**（SPA 换视频后还留着
+  // 旧的），所以必须用 videoId 校验归属，不符就当没读到。
+  function durFromPlayerResponse() {
+    const id = pageVideoId();
+    if (!id || !/^[\w-]+$/.test(id)) return NaN;
+    try {
+      const scripts = document.scripts || [];
+      const re = new RegExp('"videoDetails":\\{"videoId":"' + id
+        + '"[^{}]{0,400}?"lengthSeconds":"(\\d+)"');
+      for (let i = 0; i < scripts.length; i++) {
+        const s = scripts[i];
+        if (s.src) continue;
+        const text = s.textContent;
+        if (!text || text.indexOf('"lengthSeconds"') < 0) continue;
+        const m = re.exec(text);
+        if (m) return +m[1];
+      }
+    } catch (_) { /* ignore */ }
+    return NaN;
+  }
+
+  // 拿页面上的正片时长（读不到 NaN）。只在"视频 id 与当前 URL 一致"时采用，
+  // 否则换视频的瞬间可能读到上一支的时长，反过来把新正片判成广告。
+  // v1.4.5：读不到**不能**记成这个 id 的永久答案 —— 预播广告时页面 metadata 常常
+  // 还没渲染，一次 miss 被记住，后面这支视频的所有广告就都拿不到参照了。
+  // 改成 miss 只按 MAIN_DUR_RETRY_MS 退避重试（成功才固定下来）。
+  function mainDurFromPage(force) {
+    const id = pageVideoId();
+    if (!id) return NaN;
+    if (metaDurId === id && metaDur > 0) return metaDur;
+    const now = Date.now();
+    if (!force && metaDurId === id && now - metaDurTryAt < MAIN_DUR_RETRY_MS) return NaN;
+    metaDurTryAt = now;
     metaDurId = id;
-    metaDur = isFinite(d) ? d : 0;
-    return metaDur || NaN;
+    let d = durFromMeta();
+    let src = 'meta';
+    if (!(d > 0)) { d = durFromPlayerResponse(); src = 'playerResponse'; }
+    if (d > 0) { metaDur = d; metaDurSrc = src; return d; }
+    metaDur = 0;
+    metaDurSrc = '';
+    return NaN;
+  }
+
+  // 参照缺失时补一次。进广告那一刻调一次，之后"无参照的长媒体"每个 tick 再调（内部节流）。
+  // 拿到就以它为准：与 <video> 报的时长一致 → 判正片（不动），不一致 → 才敢跳。
+  function adoptMainDurFromPage(reason) {
+    if (mainDur > 0) return false;
+    const md = mainDurFromPage();
+    if (!(md > 0)) return false;
+    mainDur = md;
+    mainDurId = pageVideoId();
+    dlog('🎯 正片时长参照取自页面元数据（来源=', metaDurSrc, '｜', reason, '）：mainDur=',
+      Math.round(md * 10) / 10, 's（<video> 此刻报的是广告时长）');
+    return true;
   }
 
   // ---- v1.4.2：没有 .ad-showing 的广告（现场就是这种）----
@@ -1405,6 +1476,11 @@
       // 结果用户看了 16 分钟广告，日志还把结论写成"多半是 ad-showing 残留"。
       // 只有 mainDur 未知（打开链接先播广告）时才保守放弃：那时没有任何参照，
       // 推错的代价是把正片推到大结局，不可逆——宁可漏跳这一支。
+      // v1.4.5：无参照 + 媒体明显超广告量级 → 不要一句 🚫 就永久放弃。
+      // 页面参照（meta / playerResponse）可能晚一点才可用，边播边等；拿到就以它为准。
+      // 这份日志（v1.4.4）里 ads 都是 15~60s，走的是起播期 seek，所以无所谓；
+      // 但上一份日志那支 1086.5s 的广告就卡在这里 —— 参照一晚到，用户就得多看 18 分钟。
+      if (!(mainDur > 0) && dur > AD_MAX_DURATION) adoptMainDurFromPage('无参照，边播边等');
       if (dur > AD_MAX_DURATION && !notMainClip(dur)) {
         why = why || ('dur=' + dur);
         if (durTooLongLogged !== dur) {
@@ -1416,7 +1492,8 @@
           });
           dlog('🚫 广告态但媒体时长', Math.round(dur * 10) / 10, 's，且没有正片时长作参照'
             , '（mainDur=', Math.round(mainDur * 10) / 10, '），不参与强跳：推错就是把正片推到大结局，不可逆',
-            '| 广告覆盖层=', hasOverlay, hasOverlay ? '（覆盖层在，更像真广告，但仍无参照）' : '（也没有覆盖层）');
+            '| 广告覆盖层=', hasOverlay, hasOverlay ? '（覆盖层在，更像真广告，但仍无参照）' : '（也没有覆盖层）',
+            '| 参照来源=', metaDurSrc || '无（meta / playerResponse 都读不到）');
         }
         continue;
       }
@@ -1789,6 +1866,22 @@
   // 仍让 adPlaying=true，导致按 3s 持续刷屏（实际并不会动作，纯噪音）。
   // v1.3.8：minGap 用于"有跳过按钮时也要打心跳"的场景——那个分支以前完全不打，
   // 于是现场那 10 分钟的卡死期里连一条状态行都没有，只能从点击日志反推。
+  // v1.4.5：`strong= true` 到底是哪个元素撑起来的？
+  // 现场（v1.4.4 日志）有连续 322 秒 `strong= true | adPlaying= true | .ad-showing= false`，
+  // 猜是 `#player-ads` 常驻横幅，但日志里没有证据 —— 那就把它写成事实字段。
+  function overlaySel() {
+    const hits = [];
+    for (const sel of AD_OVERLAY_SELECTORS) {
+      let el = null;
+      try { el = document.querySelector(sel); } catch (_) { el = null; }
+      if (el && isVisible(el)) {
+        hits.push(sel);
+        if (hits.length >= 3) break;
+      }
+    }
+    return hits.length ? hits.join(',') : '无';
+  }
+
   function emitDebugBeat(minGap) {
     const adShowing = !!document.querySelector('.ad-showing');
     const adPlaying = isAdPlaying();
@@ -1818,6 +1911,7 @@
       dlog('🔎 调试心跳：strong=', strong, '| adPlaying=', adPlaying,
         '| .ad-showing=', adShowing,
         '| 窗口=', winNow,
+        '| 覆盖层=', overlaySel(),
         '| dur=', isFinite(dNow) ? Math.round(dNow * 10) / 10 : '未知',
         '| ct=', isFinite(ctNow) ? ctNow : '未知',
         '| mainDur=', mainDur > 0 ? Math.round(mainDur * 10) / 10 : '未知',
@@ -1900,14 +1994,8 @@
         lastVskipWhy = '';                    // 新一次广告，诊断从第一行重新打
         // v1.4.4：预播广告跑在正片 metadata 之前，<video> 那时只会报广告时长。
         // 进广告这一刻先拿页面元数据补一次参照（拿不到就算了，别编）。
-        if (!(mainDur > 0)) {
-          const md = mainDurFromPage();
-          if (md > 0) {
-            mainDur = md;
-            mainDurId = pageVideoId();
-            dlog('🎯 正片时长参照取自页面元数据：mainDur=', Math.round(md * 10) / 10, 's（此时 <video> 报的是广告时长）');
-          }
-        }
+        // v1.4.5：拿不到也不再"就算了"——后面每个 tick 会重试（见 forceSkipAdViaVideo）。
+        if (!(mainDur > 0)) adoptMainDurFromPage('进广告时');
         dlog('📺 检测到广告开始（第', adEpoch, '次）');
       } else {
         // v1.4.0 残留看门狗：窗口开着，可媒体一直是正片 —— forceSkip 反正也不会动
@@ -2083,6 +2171,13 @@
     }
   };
 
+  // v1.4.5：**先读调试开关，再启动主循环**。
+  // 现场（v1.4.4 日志第一段）的第一支广告往往在页面刚加载时就开始，而
+  // applyState() 里会立刻 tick() 一次 —— 那一 tick 早于 debug 开关读回来，
+  // 于是"广告开始 / 🎯 参照来源"这些最关键的几行被全部丢掉（打开链接先播广告
+  // 的现场，本来就指望这几行）。两个 storage 回调都是异步的，按注册顺序先读 debug 即可。
+  loadDebug();
+
   safeStorage(() => {
     chrome.storage.sync.get({ enabled: true }, (data) => {
       if (destroyed) return;
@@ -2092,8 +2187,6 @@
     });
     chrome.storage.onChanged.addListener(storageListener);
   });
-
-  loadDebug();
 
   // storage 回调万一不回来（极少见），1.5s 后按默认启用启动，保证功能可用
   setTimeout(() => {

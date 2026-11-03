@@ -946,6 +946,66 @@ function check(name, pass, detail) {
       Math.abs(t2 - 5) < 0.01, `currentTime=${t2.toFixed(2)}`);
   }
 
+  // ---------- AT: 没有 meta 时用 playerResponse 里的正片时长（来源 2）----------
+  // 现场（v1.4.4 日志，68 行）：进广告那一刻页面里没有 <meta itemprop="duration">，
+  // v1.4.4 的 `🎯` 一次都没打出来 —— 兜底等于没写。playerResponse 是首屏就带的。
+  {
+    const html = `<script>var ytInitialPlayerResponse = {"videoDetails":{"videoId":"newVideoId","title":"t","lengthSeconds":"1201"}};</script>
+      <div id="movie_player" class="html5-video-player"></div>`;
+    const opts = { duration: 313.5, currentTime: 100, paused: false };
+    const video = makeVideo(new JSDOM('').window, opts);
+    const { win, player, logs } = await loadPage(html, { video, debug: true });
+    await sleep(700);                                  // 先记下上一支视频 mainDur=313.5
+    win.history.pushState({}, '', '/watch?v=newVideoId');
+    win.document.dispatchEvent(new win.Event('yt-navigate-finish'));   // 换视频 -> 参照归零
+    opts.duration = 1086.5;                            // 新视频的预播广告
+    video.currentTime = 0.5;
+    player.classList.add('ad-showing');
+    await sleep(2200);
+    const t = video.__getTime();
+    const srcLog = logs.some((l) => l.indexOf('来源= playerResponse') >= 0);
+    check('AT 没有 meta 时用 playerResponse 的正片时长（id 校验）',
+      t > 1086 && srcLog, `currentTime=${t.toFixed(2)}, 来源日志=${srcLog}`);
+  }
+
+  // ---------- AU: playerResponse 属于别的视频 -> 不采用（AT 的安全边界）----------
+  // SPA 换视频后 playerResponse 还留着上一支的 lengthSeconds；用错了就是把新正片推到底。
+  {
+    const html = `<script>var ytInitialPlayerResponse = {"videoDetails":{"videoId":"someOtherId","title":"t","lengthSeconds":"1201"}};</script>
+      <div id="movie_player" class="html5-video-player"></div>`;
+    const opts = { duration: 313.5, currentTime: 100, paused: false };
+    const video = makeVideo(new JSDOM('').window, opts);
+    const { win, player, logs } = await loadPage(html, { video, debug: true });
+    await sleep(700);
+    win.history.pushState({}, '', '/watch?v=newVideoId');
+    win.document.dispatchEvent(new win.Event('yt-navigate-finish'));
+    opts.duration = 1086.5;
+    video.currentTime = 0.5;
+    player.classList.add('ad-showing');
+    await sleep(2200);
+    const t = video.__getTime();
+    check('AU playerResponse 的 videoId 与当前页不符时不采用',
+      Math.abs(t - 0.5) < 0.01, `currentTime=${t.toFixed(2)}, 强跳=${logs.some((l) => l.indexOf('视频层强跳') >= 0)}`);
+  }
+
+  // ---------- AV: 参照晚到 -> 边播边等，补上后照跳 ----------
+  // v1.4.4 只"进广告那一刻"取一次参照，取不到就永久 🚫。读者看得见的现场就是
+  // "广告已经播了 10 秒，参照才在页面里出现"，by then 已经放弃。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 1086.5, currentTime: 0.5, paused: false });
+    const { win } = await loadPage(html, { video, debug: true });
+    await sleep(2000);                              // 前 2 秒没有任何参照 -> 应该没动
+    const before = video.__getTime();
+    const s = win.document.createElement('script');
+    s.textContent = 'var ytInitialPlayerResponse = {"videoDetails":{"videoId":"dQw4w9WgXcQ","title":"t","lengthSeconds":"1201"}}';
+    win.document.body.appendChild(s);                // 元数据晚到
+    await sleep(5000);
+    const after = video.__getTime();
+    check('AV 参照晚到时边播边等，补上后仍强跳',
+      Math.abs(before - 0.5) < 0.01 && after > 1086, `之前=${before.toFixed(2)}, 之后=${after.toFixed(2)}`);
+  }
+
   const failed = results.filter((r) => !r.pass);
   console.log(`\n共 ${results.length} 项，通过 ${results.length - failed.length}，失败 ${failed.length}`);
   process.exit(failed.length ? 1 : 0);
