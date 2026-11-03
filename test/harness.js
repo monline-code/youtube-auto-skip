@@ -54,6 +54,7 @@ function makeChrome(init) {
       id: 'test-ext',
       lastError: undefined,
       getManifest: () => ({ version: require('../manifest.json').version }),
+      getURL: (p) => 'chrome-extension://test-ext/' + p,
       onMessage: { addListener: (l) => msgListeners.push(l) },
     },
     storage: {
@@ -99,6 +100,19 @@ function makeVideo(win, opts) {
   });
   v.__getTime = () => t;
   return v;
+}
+
+// 模拟 inj.js 的 postMessage 上报（jsdom 里外部脚本不会执行，只能手工派事件）
+function bridgePush(win, urlId, cands, playing) {
+  try {
+    win.dispatchEvent(new win.MessageEvent('message', {
+      data: {
+        __ytas: 'ytas-bridge', op: 'push',
+        urlId: urlId, playing: playing || '', cands: cands || [], playerApi: true,
+      },
+      source: win,
+    }));
+  } catch (_) { /* ignore */ }
 }
 
 async function loadPage(html, { video, enabled = true, debug = false, stub, zeroRect, url } = {}) {
@@ -895,7 +909,7 @@ function check(name, pass, detail) {
     player.classList.add('ad-showing');
     await sleep(2000);
     const t = video.__getTime();
-    const metaLog = logs.some((l) => l.indexOf('正片时长参照取自页面元数据') >= 0);
+    const metaLog = logs.some((l) => l.indexOf('正片时长参照取自页面') >= 0);
     check('AQ 没有 mainDur 时用页面元数据当正片参照',
       t > 1086 && metaLog, `currentTime=${t.toFixed(2)}, 元数据日志=${metaLog}`);
   }
@@ -963,7 +977,7 @@ function check(name, pass, detail) {
     player.classList.add('ad-showing');
     await sleep(2200);
     const t = video.__getTime();
-    const srcLog = logs.some((l) => l.indexOf('来源= playerResponse') >= 0);
+    const srcLog = logs.some((l) => l.indexOf('内联playerResponse') >= 0);
     check('AT 没有 meta 时用 playerResponse 的正片时长（id 校验）',
       t > 1086 && srcLog, `currentTime=${t.toFixed(2)}, 来源日志=${srcLog}`);
   }
@@ -1004,6 +1018,71 @@ function check(name, pass, detail) {
     const after = video.__getTime();
     check('AV 参照晚到时边播边等，补上后仍强跳',
       Math.abs(before - 0.5) < 0.01 && after > 1086, `之前=${before.toFixed(2)}, 之后=${after.toFixed(2)}`);
+  }
+
+  // ---------- AW: 页面桥补上正片参照 -> 长广告照样跳 ----------
+  // 现场（v1.4.5 日志）那句 `🎯` 一次没出现：隔离世界既看不到页面 JS 全局，也啃不动
+  // 内联脚本。改成 inj.js 在页面世界读、postMessage 回来。这条用例模拟"桥推送到位"。
+  {
+    const html = `<div id="movie_player" class="html5-video-player"></div>`;
+    const opts = { duration: 313.5, currentTime: 100, paused: false };
+    const video = makeVideo(new JSDOM('').window, opts);
+    const { win, player, logs } = await loadPage(html, { video, debug: true });
+    await sleep(400);
+    bridgePush(win, 'dQw4w9WgXcQ', [{ src: 'player.getPlayerResponse', id: 'dQw4w9WgXcQ', dur: 313.5 }]);
+    await sleep(300);
+    win.history.pushState({}, '', '/watch?v=newVideoId');
+    win.document.dispatchEvent(new win.Event('yt-navigate-finish'));   // 换视频 -> 参照归零
+    opts.duration = 1086.5;                            // 新视频的预播长广告
+    video.currentTime = 0.5;
+    player.classList.add('ad-showing');
+    bridgePush(win, 'newVideoId', [{ src: 'player.getPlayerResponse', id: 'newVideoId', dur: 1201 }]);
+    await sleep(2200);
+    const t = video.__getTime();
+    const gotRef = logs.some((l) => l.indexOf('🎯 正片时长参照取自页面桥') >= 0);
+    check('AW 页面桥补上参照后长广告照跳',
+      t > 1086 && gotRef, `currentTime=${t.toFixed(2)}, 桥参照日志=${gotRef}`);
+  }
+
+  // ---------- AX: 桥报的是广告自己的 playerResponse -> 不采用（AT 的安全边界）----------
+  // 播放器在播广告时可能报广告的 videoDetails，lengthSeconds 是广告时长。拿它当正片
+  // 参照结论正好反过来（把广告当正片，一律不跳），所以只认 id 与 URL 一致的那个。
+  {
+    const html = `<div id="movie_player" class="html5-video-player"></div>`;
+    const opts = { duration: 313.5, currentTime: 100, paused: false };
+    const video = makeVideo(new JSDOM('').window, opts);
+    const { win, player, logs } = await loadPage(html, { video, debug: true });
+    await sleep(400);
+    win.history.pushState({}, '', '/watch?v=newVideoId');
+    win.document.dispatchEvent(new win.Event('yt-navigate-finish'));
+    opts.duration = 1086.5;
+    video.currentTime = 0.5;
+    player.classList.add('ad-showing');
+    bridgePush(win, 'newVideoId', [{ src: 'player.getPlayerResponse', id: 'adVideoId', dur: 1086.5 }]);
+    await sleep(2200);
+    const t = video.__getTime();
+    const miss = logs.filter((l) => l.indexOf('❓ 拿不到正片时长参照') >= 0);
+    check('AX 桥的 id 与页面不符时不采用', Math.abs(t - 0.5) < 0.01 && miss.length === 1
+      && miss[0].indexOf('adVideoId') >= 0,
+      `currentTime=${t.toFixed(2)}, 缺参照行=${miss.length}`);
+  }
+
+  // ---------- AY: 三个来源全空 -> 只打一条逐项事实，不刷屏 ----------
+  {
+    const html = `<div id="movie_player" class="html5-video-player"></div>`;
+    // 现场：页面加载了但播放器没起来（`dur= 未知` 撑了 372 秒）就进了预播广告
+    const opts = { duration: NaN, currentTime: 0, paused: false };
+    const video = makeVideo(new JSDOM('').window, opts);
+    const { player, logs } = await loadPage(html, { video, debug: true });
+    await sleep(500);
+    opts.duration = 1086.5;
+    video.currentTime = 0.5;
+    player.classList.add('ad-showing');
+    await sleep(4500);                                 // 足有两轮重试
+    const miss = logs.filter((l) => l.indexOf('❓ 拿不到正片时长参照') >= 0);
+    check('AY 三来源全空时只打一条事实行', miss.length === 1
+      && miss[0].indexOf('桥=') >= 0 && miss[0].indexOf('meta=') >= 0 && miss[0].indexOf('内联=') >= 0,
+      `行数=${miss.length}`);
   }
 
   const failed = results.filter((r) => !r.pass);

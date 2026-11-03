@@ -252,6 +252,22 @@
  *  - [日志] 心跳补 `覆盖层=`（是哪几个元素把 `strong` 撑成 true 的）。
  *    v1.4.4 日志里连续 322 秒 `strong=true | adPlaying=true | .ad-showing=false`，
  *    当时只能猜是 `#player-ads` 常驻横幅 —— 猜的东西不该留在脑子里
+ *
+ * v1.4.6：正片时长参照改从页面世界读（三个来源全在隔离世界里猜，现场三次都空）
+ *  - [事实] 现场日志（v1.4.5，53 行）：`dur= 未知` 持续 372 秒（页面加载了，但播放器
+ *    还没初始化就进了预播广告），整段 `mainDur= 未知`，`🎯` 又是一行都没打。
+ *    同时 `strong=true | 覆盖层= 无 | 玩家类=` 截断在 80 字符 —— 连"靠什么判成广告"
+ *    都看不出来。三次失败同一个根因：**在隔离世界里猜页面**
+ *    （`meta` 不在、内联脚本正则啃不动几 MB 文本、ytInitialPlayerResponse 不在隔离世界）
+ *  - [改动] 新增 inj.js（manifest web_accessible_resources）在页面世界读
+ *    `movie_player.getPlayerResponse()` / `ytInitialPlayerResponse`，
+ *    把**候选值 + 它的 videoId** 一起 postMessage 回来；content 侧只采用
+ *    id 与 URL 一致的那个（防"拿广告时长当正片参照"）
+ *  - [改动] 桥一上报指向当前视频的时长就立刻采用（不等 3s 退避）：预播广告就在
+ *    播放器刚起来那一两秒，等一轮退避用户已经看掉半支
+ *  - [日志] 三个来源全读不到时打一行 `❓ 拿不到正片时长参照`，逐项写清
+ *    桥/meta/内联各自的状态（每个视频只一条）；心跳的 `playerCls` 换成
+ *    `玩家类= ad-showing,ad-interrupting(共N)`，不再被截断吃掉关键类名
  */
 (() => {
   'use strict';
@@ -262,7 +278,7 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.4.5'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.4.6'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
@@ -1226,6 +1242,90 @@
   let metaDurSrc = '';      // 读成功时用的哪个来源（写进日志，别让人再猜）
   let metaDurTryAt = 0;     // 上次尝试读取的时间（读不到也不许记成永久答案）
 
+  // ---- v1.4.6：正片时长的第三个来源（页面世界中转，inj.js）----
+  // 现场（v1.4.5 日志，53 行）：`dur= 未知` 持续 372 秒（页面加载了，但播放器还没
+  // 初始化就进了预播广告），整段广告 `mainDur= 未知`，`🎯` 又是一行都没打出来。
+  // 三版都栽在同一处：**在隔离世界里猜页面**。隔离世界看不到页面的 JS 全局
+  // （ytInitialPlayerResponse）和元素上挂的方法（getPlayerResponse），
+  // 内联脚本正则也啃不动那份几 MB 的文本。改成让 inj.js 在页面世界读、postMessage 回来。
+  //
+  // 关键设计：桥报的是**候选值 + 它的 videoId**，采用前必须与当前 URL 的 id 对上。
+  // 播放器在播广告时可能报广告自己的 playerResponse（lengthSeconds 是广告时长），
+  // 拿它当正片参照，结论正好反过来 —— 把广告当正片，一律不跳。
+  const BRIDGE_TAG = 'ytas-bridge';
+  const bridge = {
+    ever: false, at: 0, urlId: '', playing: '', cands: [], api: false, injectErr: '',
+  };
+
+  function installBridge() {
+    try { window.addEventListener('message', onBridgeMsg, false); } catch (_) { /* ignore */ }
+    try {
+      const s = document.createElement('script');
+      s.src = chrome.runtime.getURL('inj.js');
+      s.async = false;
+      s.addEventListener('load', () => { try { s.remove(); } catch (_) { /* ignore */ } });
+      (document.head || document.documentElement).appendChild(s);
+    } catch (e) {
+      bridge.injectErr = '注入失败(' + ((e && e.message) || e) + ')';
+    }
+  }
+
+  function onBridgeMsg(e) {
+    if (e.source !== window) return;
+    const d = e.data;
+    if (!d || d.__ytas !== BRIDGE_TAG || d.op !== 'push') return;
+    bridge.ever = true;
+    bridge.at = Date.now();
+    bridge.urlId = d.urlId || '';
+    bridge.playing = d.playing || '';
+    bridge.cands = Array.isArray(d.cands) ? d.cands : [];
+    bridge.api = !!d.playerApi;
+    // 拿到指向当前视频的时长就立刻采用，不等 3s 退避：
+    // 预播广告基本都在"播放器刚起来"那一两秒里，等一轮退避用户已经看掉半支广告。
+    adoptBridgeDur('桥推送');
+  }
+
+  function askBridge() {
+    try { window.postMessage({ __ytas: BRIDGE_TAG, op: 'get' }, '*'); } catch (_) { /* ignore */ }
+  }
+
+  // 只认 id 与当前 URL 一致的候选
+  function bridgePick() {
+    if (!bridge.ever) return null;
+    const id = pageVideoId();
+    if (!id) return null;
+    for (let i = 0; i < bridge.cands.length; i++) {
+      const c = bridge.cands[i];
+      if (c && c.dur > 0 && c.id === id) return c;
+    }
+    return null;
+  }
+
+  // 桥的事实状态（写进日志，只陈述事实，不下结论）
+  function bridgeState() {
+    if (bridge.injectErr) return bridge.injectErr;
+    if (!bridge.ever) return '无响应';
+    const age = Math.round((Date.now() - bridge.at) / 1000) + 's前';
+    if (!bridge.cands.length) return '空值' + (bridge.api ? '' : '(无播放器API)') + '/' + age;
+    return bridge.cands.map((c) => c.id + '=' + Math.round(c.dur * 10) / 10 + 's').join(',') + '/' + age;
+  }
+
+  // 用桥上报的值补 mainDur（只在 mainDur 还空着时；跳一支广告不改变正片时长，
+  // 所以这里不做"跳成功就作废"，作废只由换视频负责）
+  function adoptBridgeDur(reason) {
+    if (mainDur > 0) return false;
+    const c = bridgePick();
+    if (!c) return false;
+    mainDur = c.dur;
+    mainDurId = pageVideoId();
+    metaDur = c.dur;
+    metaDurSrc = '桥:' + c.src;
+    metaDurId = mainDurId;
+    dlog('🎯 正片时长参照取自页面桥（来源=', c.src, '｜', reason, '）：mainDur=',
+      Math.round(c.dur * 10) / 10, 's（广告在播时也读得到）');
+    return true;
+  }
+
   // 来源 1：`<meta itemprop="duration" content="PT16M14.6S">`（ISO 8601）
   function durFromMeta() {
     try {
@@ -1239,23 +1339,47 @@
   // 那行 meta，`🎯` 一次都没打出来 —— 兜底等于没写。
   // playerResponse 首屏 HTML 就带着，但它描述的是**首屏那支视频**（SPA 换视频后还留着
   // 旧的），所以必须用 videoId 校验归属，不符就当没读到。
-  function durFromPlayerResponse() {
+  // v1.4.6：改成返回 {dur, state}，读不到时把**原因**带回去写进日志 ——
+  // "没有这行脚本"和"脚本在但 id 不符"是两件完全不同的事，以前一律 NaN，只能靠猜。
+  function inlineRes() {
     const id = pageVideoId();
-    if (!id || !/^[\w-]+$/.test(id)) return NaN;
+    if (!id || !/^[\w-]+$/.test(id)) return { dur: NaN, state: '无页面id' };
+    let seen = 0;
+    let mismatch = '';
     try {
       const scripts = document.scripts || [];
-      const re = new RegExp('"videoDetails":\\{"videoId":"' + id
-        + '"[^{}]{0,400}?"lengthSeconds":"(\\d+)"');
+      const re = new RegExp('"videoDetails":\\{"videoId":"([\\w-]+)"[^{}]{0,400}?"lengthSeconds":"(\\d+)"');
       for (let i = 0; i < scripts.length; i++) {
         const s = scripts[i];
         if (s.src) continue;
         const text = s.textContent;
         if (!text || text.indexOf('"lengthSeconds"') < 0) continue;
+        seen++;
         const m = re.exec(text);
-        if (m) return +m[1];
+        if (!m) continue;
+        if (m[1] === id) return { dur: +m[2], state: '有' };
+        mismatch = mismatch || m[1];
       }
     } catch (_) { /* ignore */ }
-    return NaN;
+    if (mismatch) return { dur: NaN, state: 'id不符(' + mismatch + ')' };
+    return { dur: NaN, state: seen ? '有脚本但没匹配到' : '无脚本' };
+  }
+
+  function durFromPlayerResponse() { return inlineRes().dur; }
+
+  // "拿不到参照"这类事实每个视频只打一条 —— 现场最怕的就是一行废话刷满 500 行缓冲
+  let refDiagId = '';
+  function logRefMissing() {
+    const id = pageVideoId();
+    if (refDiagId === id) return;
+    refDiagId = id;
+    let inl = { state: '?' };
+    try { inl = inlineRes(); } catch (_) { /* ignore */ }
+    dlog('❓ 拿不到正片时长参照：页面id=', id || '无',
+      '| 桥=', bridgeState(),
+      '| meta=', durFromMeta() > 0 ? '有' : '无',
+      '| 内联=', inl.state,
+      '| 这条每个视频只说一次');
   }
 
   // 拿页面上的正片时长（读不到 NaN）。只在"视频 id 与当前 URL 一致"时采用，
@@ -1263,6 +1387,8 @@
   // v1.4.5：读不到**不能**记成这个 id 的永久答案 —— 预播广告时页面 metadata 常常
   // 还没渲染，一次 miss 被记住，后面这支视频的所有广告就都拿不到参照了。
   // 改成 miss 只按 MAIN_DUR_RETRY_MS 退避重试（成功才固定下来）。
+  // v1.4.6：来源顺序改为 桥 → meta → 内联。桥是唯一"读到的是页面世界里活对象"的
+  // 来源，也是唯一在 SPA 换视频后仍然最新的来源。
   function mainDurFromPage(force) {
     const id = pageVideoId();
     if (!id) return NaN;
@@ -1271,12 +1397,15 @@
     if (!force && metaDurId === id && now - metaDurTryAt < MAIN_DUR_RETRY_MS) return NaN;
     metaDurTryAt = now;
     metaDurId = id;
-    let d = durFromMeta();
-    let src = 'meta';
-    if (!(d > 0)) { d = durFromPlayerResponse(); src = 'playerResponse'; }
+    const bc = bridgePick();
+    let d = bc ? bc.dur : NaN;
+    let src = bc ? ('桥:' + bc.src) : '';
+    if (!(d > 0)) { d = durFromMeta(); src = 'meta'; }
+    if (!(d > 0)) { d = durFromPlayerResponse(); src = '内联playerResponse'; }
     if (d > 0) { metaDur = d; metaDurSrc = src; return d; }
     metaDur = 0;
     metaDurSrc = '';
+    logRefMissing();
     return NaN;
   }
 
@@ -1288,7 +1417,7 @@
     if (!(md > 0)) return false;
     mainDur = md;
     mainDurId = pageVideoId();
-    dlog('🎯 正片时长参照取自页面元数据（来源=', metaDurSrc, '｜', reason, '）：mainDur=',
+    dlog('🎯 正片时长参照取自页面（来源=', metaDurSrc, '｜', reason, '）：mainDur=',
       Math.round(md * 10) / 10, 's（<video> 此刻报的是广告时长）');
     return true;
   }
@@ -1882,6 +2011,20 @@
     return hits.length ? hits.join(',') : '无';
   }
 
+  // v1.4.6：现场日志里 `playerCls` 被截断在 80 字符，`ad-interrupting` 正好被切掉，
+  // 于是 "strong=true | .ad-showing=false | 覆盖层=无 到底靠什么撑起来" 又变成猜。
+  // 只打和广告有关的那几个类名：长度可控，事实不丢。
+  function playerClassFacts(player) {
+    if (!player || !player.classList) return '无';
+    const all = player.classList;
+    const hits = [];
+    for (let i = 0; i < all.length; i++) {
+      const c = all[i];
+      if (c === 'ad-showing' || c === 'ad-interrupting' || c.indexOf('ytp-ad') === 0) hits.push(c);
+    }
+    return (hits.length ? hits.join(',') : '无广告类') + '(共' + all.length + ')';
+  }
+
   function emitDebugBeat(minGap) {
     const adShowing = !!document.querySelector('.ad-showing');
     const adPlaying = isAdPlaying();
@@ -1912,10 +2055,10 @@
         '| .ad-showing=', adShowing,
         '| 窗口=', winNow,
         '| 覆盖层=', overlaySel(),
+        '| 玩家类=', playerClassFacts(player),
         '| dur=', isFinite(dNow) ? Math.round(dNow * 10) / 10 : '未知',
         '| ct=', isFinite(ctNow) ? ctNow : '未知',
         '| mainDur=', mainDur > 0 ? Math.round(mainDur * 10) / 10 : '未知',
-        '| playerCls=', player && player.className && String(player.className).slice(0, 80),
         '| 选择器命中数=', hitCount);
     }
   }
@@ -1995,6 +2138,9 @@
         // v1.4.4：预播广告跑在正片 metadata 之前，<video> 那时只会报广告时长。
         // 进广告这一刻先拿页面元数据补一次参照（拿不到就算了，别编）。
         // v1.4.5：拿不到也不再"就算了"——后面每个 tick 会重试（见 forceSkipAdViaVideo）。
+        // v1.4.6：先向桥要一次最新的（页面世界里的 playerResponse 才是 SPA 之后那份），
+        // 再走本地来源。桥是异步的，答复到了会在 onBridgeMsg 里立刻采用。
+        askBridge();
         if (!(mainDur > 0)) adoptMainDurFromPage('进广告时');
         dlog('📺 检测到广告开始（第', adEpoch, '次）');
       } else {
@@ -2176,6 +2322,9 @@
   // applyState() 里会立刻 tick() 一次 —— 那一 tick 早于 debug 开关读回来，
   // 于是"广告开始 / 🎯 参照来源"这些最关键的几行被全部丢掉（打开链接先播广告
   // 的现场，本来就指望这几行）。两个 storage 回调都是异步的，按注册顺序先读 debug 即可。
+  // v1.4.6：桥也要尽早起 —— 它第一次上报就可能把 mainDur 填上，而这一步理应
+  // 发生在任何广告开始之前。
+  installBridge();
   loadDebug();
 
   safeStorage(() => {
