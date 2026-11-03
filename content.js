@@ -203,6 +203,22 @@
  *    单看前者会误伤（#player-ads 在正片里也常驻可见），单看后者不够，两个一起才硬
  *  - [改动] 强跳成功 / `yt-navigate-finish` 后作废 mainDur：新上场的正片时长若与
  *    上一支不同，旧参照会把新正片判成"不是正片"。作废后退回保守一侧（宁漏跳）
+ *
+ * v1.4.3：修 v1.4.2 自己挖的坑 —— "跳成功就作废参照"让后面每支广告都瞎
+ *  - [事故] 现场日志：+363689 跳掉 15s 那支广告时把 mainDur 清零（v1.4.2 加的行），
+ *    5 秒后 `mainDur= 0`；等到 +755520 换上一支 dur=3225 的媒体，已经没有参照，
+ *    只能 🚫 放弃 —— 用户继续硬看。**跳一支广告并不改变正片时长**，作废等于
+ *    "跳一次就瞎一次"，pod 里第二支长广告必然漏跳。
+ *  - [改动] 删掉"强跳成功即 mainDur = 0"：参照只由 `yt-navigate-finish`（换视频）
+ *    作废，那里才是唯一真正会让 mainDur 失效的时机
+ *  - [改动] findSkipButton 增加窗口前置条件：窗口没开（只是 #player-ads 常驻横幅）
+ *    就不点按钮，免得白烧点击预算；但**不**按"🧹 判过残留"一刀切 —— 没有正片参照
+ *    时点跳过按钮是唯一剩下的手段
+ *  - [改动] 点击改为多点候选：内层 <button> 一起点 + `elementFromPoint` 命中测试留痕
+ *    （现场点了 4 次那个 86x36 的按钮，广告毫不动静，日志却说不出为什么）
+ *  - [改动] "冷却/排队中"从 6s 节流改为每支广告只提示一次（现场刷了 180 秒）
+ *  - [日志] 心跳补 dur / ct / mainDur / 窗口 四个事实字段 —— 现场那 321 秒
+ *    `strong=true | .ad-showing=false | 命中数=0` 光看旧字段判不出是广告还是横幅
  */
 (() => {
   'use strict';
@@ -213,7 +229,7 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.4.2'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.4.3'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
@@ -690,23 +706,11 @@
     return el;
   }
 
-  function clickElement(el) {
-    lastClickMap.set(el, { t: Date.now(), seq: adScopedSeq });
-    const original = el;
-    el = resolveClickableBox(el);
-    const rect = el.getBoundingClientRect();
-    dlog('🖱️ 实际点击:', (el.tagName || '').toLowerCase(),
-      '| rect=', Math.round(rect.width) + 'x' + Math.round(rect.height),
-      '| 升级到祖先=', el !== original,
-      '| cls=', classOf(el).slice(0, 60));
-    // 0 尺寸节点（如 YouTube 为兼容保留的隐藏 .ytp-skip-ad-button 壳）：
-    // 不能用 (0,0) 坐标派发鼠标事件（可能命中无关位置），只发原生 click()。
-    if (rect.width <= 0 || rect.height <= 0) {
-      try { el.click(); } catch (_) { /* ignore */ }
-      return;
-    }
-    const x = rect.left + rect.width / 2;
-    const y = rect.top + rect.height / 2;
+  // v1.4.3：click() 只在一个元素上派发事件是不够的。现场（v1.4.2 日志）对那个
+  // 86x36 的 ytp-skip-ad-button 点了 4 次，广告一点动静都没有；下一份日志必须能
+  // 分清是"内层 button 才是监听者""这一像素被别的层挡住"，还是事件本身被忽略。
+  // 所以这里补两件事：内层真按钮一起点 + elementFromPoint 命中测试留痕。
+  function dispatchClickSeq(el, x, y) {
     // composed: true 是关键——新版按钮在 shadow root 内，
     // 非 composed 的事件穿不出 shadow 边界，YouTube 的监听器收不到，
     // 于是"点了没反应"。
@@ -729,8 +733,56 @@
       } catch (_) { /* ignore */ }
     }
     try { el.click(); } catch (_) { /* ignore */ }
+  }
+
+  function clickElement(el) {
+    lastClickMap.set(el, { t: Date.now(), seq: adScopedSeq });
+    const original = el;
+    el = resolveClickableBox(el);
+    const rect = el.getBoundingClientRect();
+    // 0 尺寸节点（如 YouTube 为兼容保留的隐藏 .ytp-skip-ad-button 壳）：
+    // 不能用 (0,0) 坐标派发鼠标事件（可能命中无关位置），只发原生 click()。
+    if (rect.width <= 0 || rect.height <= 0) {
+      dlog('🖱️ 实际点击:', (el.tagName || '').toLowerCase(),
+        '| rect= 0x0 | 升级到祖先=', el !== original,
+        '| cls=', classOf(el).slice(0, 60), '| 只发原生 click（无布局盒）');
+      try { el.click(); } catch (_) { /* ignore */ }
+      return;
+    }
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    let hit = null;
+    try {
+      if (typeof document.elementFromPoint === 'function') hit = document.elementFromPoint(x, y);
+    } catch (_) { hit = null; }
+
+    const targets = [el];
+    // a) 内层真按钮：外壳 + shadow 里的 <button> 是常见结构，监听往往挂在内层
+    try {
+      const inner = el.querySelectorAll ? el.querySelectorAll('button, [role="button"]') : [];
+      for (const b of inner) {
+        if (targets.length >= 3) break;
+        if (b === el || !isSafeClickTarget(b) || isDisabled(b) || inCountdown(b)) continue;
+        const r = b.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) targets.push(b);
+      }
+    } catch (_) { /* ignore */ }
+    // b) 命中测试结果只在"确实属于这个跳过组件"时才采用 —— 否则可能点到
+    //    广告创意/落地页，那正是 v1.2.3 里用户看到的弹窗。
+    if (hit && hit !== el && targets.indexOf(hit) < 0 && isSafeClickTarget(hit) &&
+        (el.contains(hit) || (hit.contains && hit.contains(el)) ||
+          closestDeep(hit, '.ytp-ad-skip-button-container, .ytp-skip-ad-button, .ytp-ad-player-overlay-skip-or-preview'))) {
+      targets.push(hit);
+    }
+    dlog('🖱️ 实际点击:', (el.tagName || '').toLowerCase(),
+      '| rect=', Math.round(rect.width) + 'x' + Math.round(rect.height),
+      '| 升级到祖先=', el !== original,
+      '| 候选=', targets.length,
+      '| 命中点=', hit ? ((hit.tagName || '').toLowerCase() + '.' + classOf(hit).slice(0, 28)) : '无',
+      '| cls=', classOf(el).slice(0, 60));
+    for (const t of targets) dispatchClickSeq(t, x, y);
     // 升级到外壳时，原 0×0 按钮上也可能挂着 YouTube 的处理函数，补一次原生点击
-    if (el !== original) { try { original.click(); } catch (_) { /* ignore */ } }
+    if (el !== original && targets.indexOf(original) < 0) { try { original.click(); } catch (_) { /* ignore */ } }
   }
 
   function humanDelay() {
@@ -1143,6 +1195,7 @@
     // 换支了：新的一支重新给足点击预算（pod 里上一支点完 8 次不代表下一支不用点）
     clickBudget = CLICK_BUDGET;
     clickBudgetWarned = false;
+    coolLoggedThisAd = false;
     durTooLongLogged = 0;
   }
 
@@ -1406,11 +1459,12 @@
           dlog('⏩ 长广告强跳：duration=', Math.round(dur * 10) / 10, 's ≠ 正片',
             Math.round(mainDur * 10) / 10, 's，判定为广告（长度不再是拒绝理由）');
         }
-        // v1.4.2：这支推进到结尾后，"正片时长参照"就该作废了 —— 接着上场的是正片
-        // （或下一支广告），若 mainDur 还停在上一支正片而新正片时长又不同，
-        // 下几个 tick 就会把新正片判成"不是正片"推到大结局。
-        // 作废后退回保守一侧：长时长没有参照 → 不推。宁可漏跳一支广告。
-        mainDur = 0;
+        // v1.4.3（回退 v1.4.2 的这一行）：跳完一支广告**不能**把 mainDur 作废。
+        // 现场（v1.4.2 日志）：+363689 跳掉 15s 那支 → mainDur 被清零 → 5 秒后
+        // ad 3 换上一支 dur=3225 的媒体时已经没有参照，只能 🚫 放弃、硬看广告。
+        // 跳一支广告并不会改变正片时长；作废等于"跳一次就瞎一次"，pod 里第二支
+        // 长广告必然漏跳。真正会让参照失效的只有"换视频"，那由 yt-navigate-finish
+        // 处理（见 navHandler），不该由"跳成功"兼职。
         dlog('⏩ 视频层强跳：duration=', Math.round(dur * 10) / 10,
           '→ currentTime=', Math.round(v.currentTime * 10) / 10,
           early ? '（起播期 ct=' + (Math.round(ct * 10) / 10) + '，第 ' + earlySeeks + ' 次尝试）' : '');
@@ -1564,6 +1618,11 @@
     // 之前的"盲点不可见节点"和"点击外层容器升级"，会落到广告创意/推荐位上，
     // 触发广告主的落地页 —— 这就是用户看到的"弹出窗口"。全部移除。
     if (!adStateStrong()) return null;
+    // v1.4.3：窗口没开就说明"没有可跳的广告"。adStateStrong 会被常驻覆盖层
+    // （#player-ads 在正片里也可见）撑成 true，此时盲目点按钮只会白烧点击预算。
+    // 注意这里**不**按"🧹 判过残留"一刀切：没有正片参照时，点跳过按钮是唯一
+    // 还剩下的手段（不依赖 mainDur），而重复点击已经由 CLICK_BUDGET 兜住。
+    if (!adWindowSignal()) return null;
 
     // 1) 按选择器查找"可见"目标
     const rejectNodes = [];
@@ -1659,7 +1718,7 @@
   let adStateSince = 0;   // 本次强广告态开始时间（0 = 当前不在广告）
   let lastUiAt = 0;       // v1.3.9：最后一次看到"可见广告 UI"的时间（统计剔除残留段用）
   let epochActed = false; // 本次广告内是否真的执行过跳过动作（用于准确计数）
-  let lastCoolLog = 0;    // "冷却中"提示的节流时间戳
+  let coolLoggedThisAd = false; // v1.4.3：同一支广告只提示一次"点不动"（原先按 6s 节流会刷屏）
 
   // 调试心跳：节奏按"真正的动作门控 strong(adStateStrong)"决定——
   // 广告结束/空闲态（strong=false）每 15s 一次，仅可动手的广告态才 3s 一次。
@@ -1678,6 +1737,13 @@
     // 残留态 strong 也可能是 true（覆盖层 / 空壳按钮可见），按 3s 打就是纯噪音 ——
     // 上一版现场 286 行日志里绝大多数都是这种重复心跳。
     const dNow = mediaDur();
+    // v1.4.3：心跳只报"我们是这么判的"不够，必须把判据本身写出来。现场那份日志里
+    // 有整整 321 秒 `strong=true | .ad-showing=false | 命中数=0`，光看这几项根本
+    // 判不出"是广告在播"还是"正片 + #player-ads 常驻横幅"。补上 dur / ct /
+    // mainDur / 窗口 四个事实，下次不用再猜（也避免日志替人下结论，见 v1.3.9 教训）。
+    const vNow = currentVideo();
+    const ctNow = vNow && isFinite(vNow.currentTime) ? Math.round(vNow.currentTime * 10) / 10 : NaN;
+    const winNow = adWindowSignal();
     // v1.4.1：长广告也算"会动手"（现在长度不再是拒绝理由），否则 16 分钟里
     // 全是 15s 一行的稀疏心跳，反而看不出它还在盯。
     const canAct = strong && (hitCount > 0 || !mainClipLike(dNow));
@@ -1688,6 +1754,10 @@
       const player = document.querySelector('#movie_player, .html5-video-player');
       dlog('🔎 调试心跳：strong=', strong, '| adPlaying=', adPlaying,
         '| .ad-showing=', adShowing,
+        '| 窗口=', winNow,
+        '| dur=', isFinite(dNow) ? Math.round(dNow * 10) / 10 : '未知',
+        '| ct=', isFinite(ctNow) ? ctNow : '未知',
+        '| mainDur=', mainDur > 0 ? Math.round(mainDur * 10) / 10 : '未知',
         '| playerCls=', player && player.className && String(player.className).slice(0, 80),
         '| 选择器命中数=', hitCount);
     }
@@ -1845,9 +1915,11 @@
       // 跳过按钮是"强广告态下"找到的，延迟期间广告可能已结束/元素被复用，
       // 因此 requireAd=true：点击前要求仍在强广告态（见 scheduleClick 的 S1 复检）。
       const scheduled = scheduleClick(skipBtn, () => { epochActed = true; markAdAction(Date.now()); }, null, true);
-      if (!scheduled && debug && Date.now() - lastCoolLog > 6000) {
-        lastCoolLog = Date.now();
-        dlog('（跳过按钮已找到，处于冷却/排队中，暂不重复点击）');
+      // v1.4.3：这条以前按 6 秒节流，现场因此在残留期刷了 180 秒（30 多行）。
+      // 同一支广告里"点不动"只需要说一次，预算用完时 🛑 那行已经把话说完了。
+      if (!scheduled && debug && !coolLoggedThisAd) {
+        coolLoggedThisAd = true;
+        dlog('（跳过按钮仍可见，但本支已点', CLICK_BUDGET - clickBudget, '次 / 冷却中，不再重复点击）');
       }
     }
     // v1.3.8：以前这里是 else if——只要有按钮在 DOM 里（哪怕是残留的空壳），

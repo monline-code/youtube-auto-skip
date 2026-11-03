@@ -821,6 +821,60 @@ function check(name, pass, detail) {
       `currentTime=${t.toFixed(2)}`);
   }
 
+  // ---------- AN: 跳过 pod 里第一支后，正片时长参照仍然有效 -> 下一支长广告照样跳 ----------
+  // 现场（v1.4.2 日志）：+363689 跳掉 15s 那支时把 mainDur 清零，5 秒后 ad 3 换上一支
+  // 3225s 的媒体时已经没有参照，只能 🚫 放弃、用户继续硬看。跳一支广告不会改变
+  // 正片时长，参照只该由"换视频"作废。
+  {
+    const html = `<div id="movie_player" class="html5-video-player"></div>`;
+    const opts = { duration: 5536, currentTime: 300, paused: false };
+    const video = makeVideo(new JSDOM('').window, opts);
+    const { player, logs } = await loadPage(html, { video, debug: true });
+    await sleep(700);                        // 记下 mainDur = 5536
+    opts.duration = 15;                      // pod 第一支：15s 短广告
+    video.currentTime = 0.5;
+    player.classList.add('ad-showing');
+    await sleep(1400);
+    const afterFirst = video.__getTime();
+    opts.duration = 3225;                    // pod 第二支：53 分钟长广告（.ad-showing 不摘）
+    video.currentTime = 0;
+    await sleep(1800);
+    const t = video.__getTime();
+    check('AN 跳完一支后 mainDur 不作废，pod 里下一支长广告照样强跳',
+      afterFirst > 14 && t > 3224,
+      `第一支 ct=${afterFirst.toFixed(1)}, 第二支 ct=${t.toFixed(1)}, 长广告日志=${logs.some((l) => l.indexOf('长广告强跳') >= 0)}`);
+  }
+
+  // ---------- AO: 残留期的"点不动"只提示一次，不再每 6 秒刷屏 ----------
+  // 现场（v1.4.2 日志）：+762057 判残留后仍然每 4~6 秒一行"冷却/排队中"，挂了 180 秒。
+  {
+    const html = `<div id="movie_player" class="html5-video-player">
+        <button class="ytp-skip-ad-button">跳过</button>
+      </div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 3225, currentTime: 3.4, paused: false });
+    const { player, logs } = await loadPage(html, { video, debug: true });
+    await sleep(700);                        // 记下 mainDur = 3225
+    player.classList.add('ad-showing');      // 广告结束，类名残留
+    await sleep(24000);                      // 残留 8s 退出后还要继续挂一段才看得出刷屏
+    const residual = logs.some((l) => l.indexOf('判定为广告态残留') >= 0);
+    const cool = logs.filter((l) => l.indexOf('不再重复点击') >= 0).length;
+    check('AO 残留期"点不动"只提示一次', residual && cool <= 1, `残留=${residual}, 提示行=${cool}`);
+  }
+
+  // ---------- AP: 心跳必须带判据事实（dur / ct / mainDur / 窗口）----------
+  // 现场那份日志里 321 秒 `strong=true | .ad-showing=false | 命中数=0`，光看这几项
+  // 判不出是"广告在播"还是"正片 + #player-ads 常驻横幅"，只能再赌一次。
+  {
+    const html = `<div id="movie_player" class="html5-video-player"></div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 600, currentTime: 120, paused: false });
+    const { logs } = await loadPage(html, { video, debug: true });
+    await sleep(1200);
+    const beat = logs.filter((l) => l.indexOf('调试心跳') >= 0).pop() || '';
+    check('AP 心跳带 dur/ct/mainDur/窗口 四个事实',
+      /dur=/.test(beat) && /ct=/.test(beat) && /mainDur=/.test(beat) && /窗口=/.test(beat),
+      beat.replace(/^\[YT-AutoSkip\]\s*/, '').slice(0, 120));
+  }
+
   const failed = results.filter((r) => !r.pass);
   console.log(`\n共 ${results.length} 项，通过 ${results.length - failed.length}，失败 ${failed.length}`);
   process.exit(failed.length ? 1 : 0);
