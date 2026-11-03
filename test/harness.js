@@ -101,10 +101,12 @@ function makeVideo(win, opts) {
   return v;
 }
 
-async function loadPage(html, { video, enabled = true, debug = false, stub, zeroRect } = {}) {
+async function loadPage(html, { video, enabled = true, debug = false, stub, zeroRect, url } = {}) {
+  // v1.4.4：默认给一个 watch 页 URL —— 正片时长参照要靠 URL 里的 video id 判断归属
   const dom = new JSDOM(`<!DOCTYPE html><body>${html}</body>`, {
     runScripts: 'outside-only',
     pretendToBeVisual: true,
+    url: url || 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
   });
   const win = dom.window;
   // jsdom 的 getBoundingClientRect 恒为 0，会让 isVisible 全部判为不可见。
@@ -873,6 +875,75 @@ function check(name, pass, detail) {
     check('AP 心跳带 dur/ct/mainDur/窗口 四个事实',
       /dur=/.test(beat) && /ct=/.test(beat) && /mainDur=/.test(beat) && /窗口=/.test(beat),
       beat.replace(/^\[YT-AutoSkip\]\s*/, '').slice(0, 120));
+  }
+
+  // ---------- AQ: 预播广告没有 mainDur -> 用页面元数据里的正片时长兜底 ----------
+  // 现场（v1.4.3 日志）：换视频后 `yt-navigate-finish` 清掉 mainDur，新正片的 metadata
+  // 还没进 <video>（那时报的是广告时长），于是 dur=1086.5 的广告"没有参照"只能 🚫。
+  // watch 页 <meta itemprop="duration"> 描述的是正片，广告在播时也读得到。
+  {
+    const html = `<meta itemprop="duration" content="PT16M14S">
+      <div id="movie_player" class="html5-video-player"></div>`;
+    const opts = { duration: 313.5, currentTime: 100, paused: false };
+    const video = makeVideo(new JSDOM('').window, opts);
+    const { win, player, logs } = await loadPage(html, { video, debug: true });
+    await sleep(700);                                   // 先记下上一支视频 mainDur=313.5
+    win.history.pushState({}, '', '/watch?v=newVideoId');
+    win.document.dispatchEvent(new win.Event('yt-navigate-finish'));  // 换视频 -> 参照归零
+    opts.duration = 1086.5;                            // 新视频的预播广告
+    video.currentTime = 0.5;
+    player.classList.add('ad-showing');
+    await sleep(2000);
+    const t = video.__getTime();
+    const metaLog = logs.some((l) => l.indexOf('正片时长参照取自页面元数据') >= 0);
+    check('AQ 没有 mainDur 时用页面元数据当正片参照',
+      t > 1086 && metaLog, `currentTime=${t.toFixed(2)}, 元数据日志=${metaLog}`);
+  }
+
+  // ---------- AR: 元数据时长就是当前媒体 -> 仍然不动（AQ 的安全边界）----------
+  // 少一个"元数据读错/过期"就推错的风险口子：两者一致时它只可能是正片。
+  {
+    const html = `<meta itemprop="duration" content="PT18M6.5S">
+      <div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 1086.5, currentTime: 0.5, paused: false });
+    const { logs } = await loadPage(html, { video, debug: true });
+    await sleep(2500);
+    const t = video.__getTime();
+    check('AR 元数据时长与媒体一致时不碰进度',
+      Math.abs(t - 0.5) < 0.01, `currentTime=${t.toFixed(2)}, 强跳日志=${logs.some((l) => l.indexOf('视频层强跳') >= 0)}`);
+  }
+
+  // ---------- AS: 同一个视频重发导航事件 -> 参照保留；换了 video id -> 参照作废 ----------
+  // 现场（v1.4.3 日志）+386286：跳完 15s 那支后 mainDur 突然变"未知"，正是导航事件
+  // 清掉的。同一支视频里清参照等于自废武功，必须只在 id 真变了时才清。
+  {
+    const html = `<meta itemprop="duration" content="PT5M13.5S">
+      <div id="movie_player" class="html5-video-player"></div>`;
+    const opts = { duration: 313.5, currentTime: 100, paused: false };
+    const video = makeVideo(new JSDOM('').window, opts);
+    const { win, logs } = await loadPage(html, { video, debug: true });
+    await sleep(700);                                  // 记下 mainDur = 313.5（id=dQw4w9WgXcQ）
+    win.document.dispatchEvent(new win.Event('yt-navigate-finish'));  // 同一支视频重发
+    opts.duration = 1086.5;                            // 预播广告
+    video.currentTime = 0.5;
+    win.document.querySelector('#movie_player').classList.add('ad-showing');
+    await sleep(1800);
+    const t1 = video.__getTime();
+    check('AS1 同一视频重发导航事件不作废 mainDur（广告照样跳）',
+      t1 > 1086, `currentTime=${t1.toFixed(2)}`);
+    // 换视频：pushState 改 id 后再发导航事件 -> 参照必须作废
+    win.history.pushState({}, '', '/watch?v=otherVideoId');
+    win.document.dispatchEvent(new win.Event('yt-navigate-finish'));
+    const player = win.document.querySelector('#movie_player');
+    player.classList.remove('ad-showing');
+    opts.duration = 700;                               // 新正片（与旧参照 313.5 不同）
+    video.currentTime = 5;
+    await sleep(300);
+    player.classList.add('ad-showing');                // 残留广告类名
+    await sleep(1500);
+    const t2 = video.__getTime();
+    check('AS2 换成别的 video id 后参照作废，不碰新正片',
+      Math.abs(t2 - 5) < 0.01, `currentTime=${t2.toFixed(2)}`);
   }
 
   const failed = results.filter((r) => !r.pass);

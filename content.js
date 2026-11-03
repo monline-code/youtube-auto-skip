@@ -219,6 +219,23 @@
  *  - [改动] "冷却/排队中"从 6s 节流改为每支广告只提示一次（现场刷了 180 秒）
  *  - [日志] 心跳补 dur / ct / mainDur / 窗口 四个事实字段 —— 现场那 321 秒
  *    `strong=true | .ad-showing=false | 命中数=0` 光看旧字段判不出是广告还是横幅
+ *
+ * v1.4.4：给"参照真空"补第二来源，并停止把真广告判成残留
+ *  - [事故] 现场日志（54 行）：+383128 新视频的**预播广告**开始 —— 那一瞬间
+ *    `yt-navigate-finish` 已把 mainDur 归零（换视频，清得没错），可新正片的
+ *    metadata 还没进 `<video>`（`dur` 那时只会报广告时长），于是 +389163 拿到
+ *    `dur=1086.5` 时"没有参照" → 🚫 → 用户硬看 18 分钟
+ *  - [事故 2] +396809 只过了 13.7 秒就 `🧹 判定为广告态残留`，而同一支广告的
+ *    `ct` 还在 5.4 → 20.4 正常推进：**看门狗把真广告杀了**
+ *  - [事故 3] `🖱️ 实际点击: 候选= 1 | 命中点= button.ytp-skip-ad-button` ——
+ *    事件确实落在按钮上、位置也对，广告照样不动。点击这条路对
+ *    `.ytp-skip-ad-button` 是死的（YouTube 不认合成事件），强跳才是主力
+ *  - [改动] 新增 mainDurFromPage()：预播广告进广告那一刻，用
+ *    `<meta itemprop="duration">` 里的**正片**时长补一次参照（按 video id 校验归属）
+ *  - [改动] 残留看门狗只在 `mainClipLike(d)`（能证明是正片）时 8 秒退出；
+ *    "没有参照的长媒体"改用 AD_UNKNOWN_EXIT_MS（120s）这个安全阀
+ *  - [改动] `yt-navigate-finish` 只在 video id 真的变了才作废 mainDur
+ *  - [改动] 删掉"冷却/排队中"那条日志（预算用完已有 🛑，冷却期写出来只是噪音）
  */
 (() => {
   'use strict';
@@ -229,7 +246,7 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.4.3'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.4.4'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
@@ -1116,6 +1133,9 @@
   // 86x36 的可见空壳。旧判定把它当真广告，点满 4 次熔断后每 4 秒刷一行"冷却/排队中"，
   // 📊 广告结束永不触发，一挂就是 700 秒。这里给"窗口开着但媒体是正片量级"设个上限。
   const AD_RESIDUAL_EXIT_MS = 8000;     // 连续这么久都只有正片量级时长 → 判残留
+  // v1.4.4：没有正片参照时的安全阀。8 秒就退出会把真广告判成残留（现场 1086.5s 那支
+  // 13.7 秒就被退出），所以这里只防止"跨支无限挂着"，时间给足。
+  const AD_UNKNOWN_EXIT_MS = 120000;
   const AD_RESIDUAL_QUIET_MS = 60000;   // 判残留后的静默期（真广告来了会提前解除，见 tick）
   let residualSince = 0;                // 本轮"疑似残留"的起始时间（0 = 当前不怀疑）
   let residualQuietUntil = 0;           // 静默到这个时间为止（期间不再因同一个残留 UI 进广告态）
@@ -1157,6 +1177,51 @@
     return mainDur > 0 && isFinite(d) && Math.abs(d - mainDur) > MAIN_DUR_TOLERANCE;
   }
 
+  // ---- v1.4.4：正片时长参照的第二来源（页面元数据）----
+  // 现场（v1.4.3 日志，54 行）：
+  //   +383128 新视频的预播广告开始（`yt-navigate-finish` 已把 mainDur 归零，这一步没错——
+  //           确实换视频了），+386286 `mainDur= 未知`；
+  //   +389163 广告媒体报 `dur= 1086.5`，没有参照 → 🚫 → 用户硬看 18 分钟。
+  // 问题不在"清得对不对"，而在**清完没处再取**：预播广告跑在正片 metadata 之前，
+  // `<video>.duration` 那时报的是广告时长，永远等不到正片参照。
+  // watch 页的 <head> 里有 `<meta itemprop="duration" content="PT16M14.6S">`，
+  // 它描述的是**正片**，广告在播时也读得到 —— 拿它当兜底，比"什么都不敢做"有用得多。
+  function pageVideoId() {
+    try {
+      const u = new URL(location.href);
+      const v = u.searchParams.get('v');
+      if (v) return v;
+      const m = /\/shorts\/([\w-]+)/.exec(u.pathname);
+      return m ? m[1] : '';
+    } catch (_) { return ''; }
+  }
+
+  function parseIsoDuration(s) {
+    const m = /^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?)?$/.exec(s || '');
+    if (!m) return NaN;
+    const sec = (+m[1] || 0) * 86400 + (+m[2] || 0) * 3600 + (+m[3] || 0) * 60 + (+m[4] || 0);
+    return sec > 0 ? sec : NaN;
+  }
+
+  let mainDurId = '';       // mainDur 是在哪个视频上测到的（换视频才作废）
+  let metaDurId = null;     // 下面这份元数据时长是在哪个视频上读的
+  let metaDur = 0;
+  // 拿页面元数据里的正片时长（读不到 NaN）。只在"视频 id 与当前 URL 一致"时采用，
+  // 否则换视频的瞬间可能读到上一支的时长，反过来把新正片判成广告。
+  function mainDurFromPage() {
+    const id = pageVideoId();
+    if (!id) return NaN;
+    if (metaDurId === id) return metaDur || NaN;
+    let d = NaN;
+    try {
+      const el = document.querySelector('meta[itemprop="duration"]');
+      if (el) d = parseIsoDuration(el.getAttribute('content'));
+    } catch (_) { d = NaN; }
+    metaDurId = id;
+    metaDur = isFinite(d) ? d : 0;
+    return metaDur || NaN;
+  }
+
   // ---- v1.4.2：没有 .ad-showing 的广告（现场就是这种）----
   // v1.3.9 日志里那 970 秒（16 分钟）：`adPlaying= true | .ad-showing= false | 命中数= 0`，
   // 心跳一直 strong= true —— 说明**有广告覆盖层可见**，可我们的强跳窗口只认
@@ -1179,7 +1244,7 @@
     // "时长≈正片就别动进度"这道防线对它们等于不存在。
     // 代价：广告起播瞬间若还没挂上广告标记，可能把广告时长误记成正片，
     // 之后同长度的广告会被放过一次——"漏跳一次"远好于"把正片跳到大结局"。
-    if (isFinite(d) && d > 1 && !v.paused) mainDur = d;
+    if (isFinite(d) && d > 1 && !v.paused) { mainDur = d; mainDurId = pageVideoId(); }
   }
 
   // 广告边界：清掉"按元素"记录的点击/跳转状态。
@@ -1195,7 +1260,6 @@
     // 换支了：新的一支重新给足点击预算（pod 里上一支点完 8 次不代表下一支不用点）
     clickBudget = CLICK_BUDGET;
     clickBudgetWarned = false;
-    coolLoggedThisAd = false;
     durTooLongLogged = 0;
   }
 
@@ -1718,7 +1782,6 @@
   let adStateSince = 0;   // 本次强广告态开始时间（0 = 当前不在广告）
   let lastUiAt = 0;       // v1.3.9：最后一次看到"可见广告 UI"的时间（统计剔除残留段用）
   let epochActed = false; // 本次广告内是否真的执行过跳过动作（用于准确计数）
-  let coolLoggedThisAd = false; // v1.4.3：同一支广告只提示一次"点不动"（原先按 6s 节流会刷屏）
 
   // 调试心跳：节奏按"真正的动作门控 strong(adStateStrong)"决定——
   // 广告结束/空闲态（strong=false）每 15s 一次，仅可动手的广告态才 3s 一次。
@@ -1835,6 +1898,16 @@
         lastJumpDur = 0;
         resetAdStats(adStateSince);
         lastVskipWhy = '';                    // 新一次广告，诊断从第一行重新打
+        // v1.4.4：预播广告跑在正片 metadata 之前，<video> 那时只会报广告时长。
+        // 进广告这一刻先拿页面元数据补一次参照（拿不到就算了，别编）。
+        if (!(mainDur > 0)) {
+          const md = mainDurFromPage();
+          if (md > 0) {
+            mainDur = md;
+            mainDurId = pageVideoId();
+            dlog('🎯 正片时长参照取自页面元数据：mainDur=', Math.round(md * 10) / 10, 's（此时 <video> 报的是广告时长）');
+          }
+        }
         dlog('📺 检测到广告开始（第', adEpoch, '次）');
       } else {
         // v1.4.0 残留看门狗：窗口开着，可媒体一直是正片 —— forceSkip 反正也不会动
@@ -1842,14 +1915,21 @@
         // v1.4.1：判据从"时长 > 300s"改成"这就是正片"。
         //   a) mainDur 已知且 |d - mainDur| ≤ 容差 → 正片无疑，判残留
         //   b) mainDur 未知但时长超广告量级 → 没有参照、反正也不会动手，别一直挂着
+        // v1.4.4：**b 的 8 秒太急，已改成安全阀**。现场（v1.4.3 日志）那支 1086.5s 的
+        // 真广告就在 13.7 秒被 🧹 判成残留退出（`ct` 5.4 → 20.4 明明还在正常推进），
+        // 广告还在播、我们却已经放弃。没有参照时只留 AD_UNKNOWN_EXIT_MS 这个长阀。
         // 长广告（已证明 ≠ mainDur）不在此列：旧规则会把它当残留退出，于是
         // "广告在播、我们却已经放弃"，比不退出更糟（现场 16 分钟就是这么来的）。
         const d = mediaDur();
-        const looksMain = mainClipLike(d) || (isFinite(d) && d > AD_MAX_DURATION && !(mainDur > 0));
-        if (looksMain) {
+        if (mainClipLike(d)) {
           if (!residualSince) residualSince = Date.now();
           else if (Date.now() - residualSince >= AD_RESIDUAL_EXIT_MS) {
-            exitResidual(mainClipLike(d) ? '媒体时长与正片一致' : '时长超广告量级且无正片时长作参照');
+            exitResidual('媒体时长与正片一致');
+          }
+        } else if (!(mainDur > 0) && isFinite(d) && d > AD_MAX_DURATION) {
+          if (!residualSince) residualSince = Date.now();
+          else if (Date.now() - residualSince >= AD_UNKNOWN_EXIT_MS) {
+            exitResidual('时长超广告量级且始终没有正片时长作参照（安全阀）');
           }
         } else {
           residualSince = 0;
@@ -1915,12 +1995,10 @@
       // 跳过按钮是"强广告态下"找到的，延迟期间广告可能已结束/元素被复用，
       // 因此 requireAd=true：点击前要求仍在强广告态（见 scheduleClick 的 S1 复检）。
       const scheduled = scheduleClick(skipBtn, () => { epochActed = true; markAdAction(Date.now()); }, null, true);
-      // v1.4.3：这条以前按 6 秒节流，现场因此在残留期刷了 180 秒（30 多行）。
-      // 同一支广告里"点不动"只需要说一次，预算用完时 🛑 那行已经把话说完了。
-      if (!scheduled && debug && !coolLoggedThisAd) {
-        coolLoggedThisAd = true;
-        dlog('（跳过按钮仍可见，但本支已点', CLICK_BUDGET - clickBudget, '次 / 冷却中，不再重复点击）');
-      }
+      // v1.4.4：这里不再补"冷却/排队中"那条日志 —— 它是 v1.1.x 的产物（当时没有熔断，
+      // 冷却期完全不可见）。现在预算用完有 🛑 那一行说清楚，冷却/排队是 1~3 秒的
+      // 瞬时状态，写出来只是噪音（v1.4.3 现场：点完第一次就紧跟一行"已点 1 次 / 冷却中"）。
+      void scheduled;
     }
     // v1.3.8：以前这里是 else if——只要有按钮在 DOM 里（哪怕是残留的空壳），
     // 心跳就再也不打了。现在无论有没有按钮都打，只是有按钮时放慢到 15s。
@@ -1970,7 +2048,13 @@
     // v1.4.2：换视频（SPA 导航）时正片时长参照作废。上一支视频的 mainDur 拿去
     // 判新视频，结论必然是"时长与正片不一致" → 会把新正片推到大结局。
     // 这是"用 mainDur 当判据"必须配套的清理动作（播放列表连播、点推荐最容易踩）。
-    navHandler = () => { mainDur = 0; };
+    // v1.4.4：**只在视频 id 真的变了才作废**。现场（v1.4.3 日志）+386286 那次清空
+    // 就是导航事件打过来的；同一个视频里 YouTube 也会发这个事件，顺手清掉参照
+    // 等于自废武功——那之后 dur=1086.5 的广告立刻变成"没有参照"。
+    navHandler = () => {
+      const id = pageVideoId();
+      if (id && id !== mainDurId) mainDur = 0;
+    };
     try { document.addEventListener('yt-navigate-finish', navHandler); } catch (_) { /* ignore */ }
     lastTickAt = Date.now();
     tick();
