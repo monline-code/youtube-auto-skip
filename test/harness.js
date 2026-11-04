@@ -1157,19 +1157,35 @@ function check(name, pass, detail) {
       t > 1085 && !cried, `currentTime=${t.toFixed(2)}, 误报=${cried}`);
   }
 
-  // ---------- BB: 贴尾卡住时 16× 只宣告一次 ----------
-  // 现场（v1.4.6 第一份日志）：同一句 `⏩ 广告卡在结尾不放，改用 16× 加速播放（rate=16）`
-  // 在 +50340 / +51390 / +52450 / +53514 打了 4 次 —— 速率早就是 16，重复的话只占缓冲。
+  // ---------- BB: 贴尾停滞时补发 ended 一次，且不再靠 16×（v1.5.0）----------
+  // 现场（v1.4.9 日志）：每支广告 seek 到 dur-0.6 之后，2 秒只前进 0.3 秒（≈0.15×），
+  // 最后一段没有缓冲 → 原生 ended 永远不来。v1.4.9 对此的反应是"等 3 秒开 16×"，
+  // 而 16× 之后广告照样要 0.4~0.8 秒才切，说明那 3 秒纯属白等。
   {
     const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
     const video = makeVideo(new JSDOM('').window, {
       duration: 30, currentTime: 29.5, paused: false,
     });
     const { logs } = await loadPage(html, { video, debug: true });
-    await sleep(7000);                                  // 贴尾 3s 触发加速，再看它会不会重复喊
-    const lines = logs.filter((l) => l.indexOf('改用 16× 加速') >= 0).length;
-    check('BB 贴尾卡住时 16× 只宣告一次', lines === 1, `宣告行数=${lines}`);
+    await sleep(7000);
+    const marks = logs.filter((l) => l.indexOf('🧲') >= 0).length;
+    const boosts = logs.filter((l) => l.indexOf('改用 16× 加速') >= 0).length;
+    check('BB 贴尾停滞时补发 ended 一次，且不再喊 16×',
+      marks === 1 && boosts === 0, `🧲行数=${marks}, 16×宣告=${boosts}`);
   }
+
+  // ---------- BB2: seek 一直被忽略时才走 16×，且只宣告一次（v1.5.0 保留去重）----------
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const video = makeVideo(new JSDOM('').window, {
+      duration: 60, currentTime: 1, paused: false, seekable: false,
+    });
+    const { logs } = await loadPage(html, { video, debug: true });
+    await sleep(6000);
+    const boosts = logs.filter((l) => l.indexOf('改用 16× 加速') >= 0).length;
+    check('BB2 seek 一直无效时 16× 只宣告一次', boosts === 1, `16×宣告=${boosts}`);
+  }
+
 
   // ---------- BC: 媒体已被摘掉（贴尾切流中）时不再点跳过按钮（v1.4.8）----------
   // 现场（v1.4.7 日志）：两支广告各点 2 次，全部发生在 `dur=NaN | readyState=0` 的
@@ -1205,11 +1221,13 @@ function check(name, pass, detail) {
   {
     const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
     const video = makeVideo(new JSDOM('').window, { duration: 20, currentTime: 0.5, paused: false });
-    const { win } = await loadPage(html, { video });
+    const { logs } = await loadPage(html, { video, debug: true });
     await sleep(2400);                     // 等确认窗口 + tick 落定
-    const t = win.document.querySelector('video').__getTime();
+    // v1.5.0：落点看"强跳那一行"本身 —— 之后补发 ended 会把 playhead 移到 dur，
+    // 那是本版的新行为，不该拿来否定落点。
+    const jump = logs.find((l) => l.indexOf('视频层强跳') >= 0) || '';
     check('BD 贴尾留 0.6s 让元素自己走完（不是贴在 dur-0.05）',
-      Math.abs(t - 19.4) < 0.15, `currentTime=${t.toFixed(2)}（期望 19.4）`);
+      jump.indexOf('currentTime= 19.4') >= 0, `强跳行=${jump.slice(0, 80)}`);
   }
 
   // ---------- BE: 收到原生 ended 后不再续播（v1.4.9）----------
@@ -1252,6 +1270,43 @@ function check(name, pass, detail) {
     check('BF 已在片尾时不开 16×（加速改变不了任何时间）',
       el.playbackRate === 1 && boosted === 0,
       `playbackRate=${el.playbackRate}, 加速日志=${boosted}`);
+  }
+
+  // ---------- BG: 贴尾停滞时补发的 ended 真的送达元素（v1.5.0）----------
+  // 这一条只验"我们确实把这个事件发出去了、而且落到同一个 <video> 上"，
+  // 至于 YouTube 认不认，只能靠现场日志里广告结束的时间来判断。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 15, currentTime: 0.5, paused: false });
+    let endedSeen = 0;
+    video.addEventListener('ended', () => { endedSeen += 1; });
+    const { win, logs } = await loadPage(html, { video, debug: true });
+    await sleep(2800);                     // 强跳 → 0.7s 采样判停滞 → 补发
+    const el = win.document.querySelector('video');
+    const marks = logs.filter((l) => l.indexOf('🧲') >= 0).length;
+    const selfMark = logs.filter((l) => l.indexOf('补发') >= 0).length;
+    check('BG 贴尾停滞时补发 ended（一次，且 playhead 落到 dur）',
+      marks === 1 && endedSeen >= 1 && Math.abs(el.__getTime() - 15) < 0.01,
+      `🧲行数=${marks}, 收到 ended=${endedSeen}, ct=${el.__getTime()}, 补发标记=${selfMark}`);
+  }
+
+  // ---------- BH: 贴尾仍在正常推进时**不**补发 ended（v1.5.0）----------
+  // 补发是"元素停住"的对策，不是见尾就发。这里模拟 ~0.4× 的推进（视频在走、
+  // 只是慢），补发一旦触发就说明判据写成了"见尾即发"。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 20, currentTime: 0.5, paused: false });
+    const { win, logs } = await loadPage(html, { video, debug: true });
+    await sleep(1300);                     // 已贴到 19.4
+    const el = win.document.querySelector('video');
+    const timer = setInterval(() => {
+      el.currentTime = Math.min(19.98, el.currentTime + 0.04);
+    }, 100);                               // ≈0.4×
+    await sleep(1000);
+    clearInterval(timer);
+    const marks = logs.filter((l) => l.indexOf('🧲') >= 0).length;
+    check('BH 贴尾仍在推进时不补发 ended（补发只对"停住"生效）',
+      marks === 0, `🧲行数=${marks}, ct=${el.__getTime().toFixed(2)}`);
   }
 
   const failed = results.filter((r) => !r.pass);
