@@ -806,25 +806,27 @@ function check(name, pass, detail) {
   // 现场（v1.3.9 日志前 970 秒 ≈ 16 分钟）：`adPlaying= true | .ad-showing= false |
   // 命中数= 0`，心跳一直 strong= true（有广告覆盖层可见），可窗口既不看 adPlaying
   // 也不看这个覆盖层 → 整段没开窗、一次都没动手。用户确认那段时间广告是真的在播。
-  // 这里用 #player-ads（在 AD_OVERLAY 里、不在 AD_FRAME 里）+ 时长已证明 ≠ 正片。
+  // v1.4.7：信号从 `#player-ads` 换成 `.ad-interrupting`。现场（v1.4.6 日志）证明
+  // `#player-ads` 在正片播放时也一直可见，靠它判广告会把整个正片当广告；
+  // 而 `.ad-interrupting` 只在真的在播广告时挂上（现场心跳 `玩家类= ad-showing,ad-interrupting`）。
   {
-    const html = `<div id="movie_player" class="html5-video-player"></div>
-      <div id="player-ads"></div>`;
+    const html = `<div id="movie_player" class="html5-video-player"></div>`;
     const opts = { duration: 5536, currentTime: 300, paused: false };
     const video = makeVideo(new JSDOM('').window, opts);
-    const { logs } = await loadPage(html, { video, debug: true });
+    const { player, logs } = await loadPage(html, { video, debug: true });
     await sleep(700);                        // 非广告态：记下 mainDur = 5536
-    opts.duration = 3225;                    // 换成广告（没有 .ad-showing）
+    player.classList.add('ad-interrupting');  // 广告在播，但没有 .ad-showing
+    opts.duration = 3225;                    // 换成广告
     video.currentTime = 3.4;
     await sleep(1800);
     const t = video.__getTime();
-    check('AL 只有广告覆盖层、没有 ad-showing 的长广告也强跳',
+    check('AL 只有 ad-interrupting、没有 ad-showing 的长广告也强跳',
       t > 3224, `currentTime=${t.toFixed(2)}, 检测=${logs.some((l) => l.indexOf('检测到广告开始') >= 0)}`);
   }
 
-  // ---------- AM: 覆盖层可见 + 时长就是正片 -> 仍然不动（AL 的安全边界）----------
-  // #player-ads 在正片播放时也常驻可见，单靠 isAdPlaying() 会把正片当广告。
-  // 所以 AL 那条必须叠加"时长 ≠ 正片"，这里验证时长一致时一步都不动。
+  // ---------- AM: 只有 #player-ads 横幅 + 时长就是正片 -> 不动（AL 的安全边界）----------
+  // #player-ads 在正片播放时也常驻可见，单靠它判广告会把正片当广告。
+  // v1.4.7 起它已从 AD_OVERLAY_SELECTORS 移除，这条用例同时守住"别再加回来"。
   {
     const html = `<div id="movie_player" class="html5-video-player"></div>
       <div id="player-ads"></div>`;
@@ -832,7 +834,7 @@ function check(name, pass, detail) {
     const { logs } = await loadPage(html, { video, debug: true });
     await sleep(2000);
     const t = video.__getTime();
-    check('AM 覆盖层可见但时长等于正片时不动进度',
+    check('AM 横幅可见但时长等于正片时不动进度',
       Math.abs(t - 300) < 0.01 && !logs.some((l) => l.indexOf('检测到广告开始') >= 0),
       `currentTime=${t.toFixed(2)}`);
   }
@@ -1059,7 +1061,8 @@ function check(name, pass, detail) {
     video.currentTime = 0.5;
     player.classList.add('ad-showing');
     bridgePush(win, 'newVideoId', [{ src: 'player.getPlayerResponse', id: 'adVideoId', dur: 1086.5 }]);
-    await sleep(2200);
+    // v1.4.7：要等过"❓ 宽限期"(2.5s) + 一次 3s 退避重试，这条事实行才会出现
+    await sleep(3600);
     const t = video.__getTime();
     const miss = logs.filter((l) => l.indexOf('❓ 拿不到正片时长参照') >= 0);
     check('AX 桥的 id 与页面不符时不采用', Math.abs(t - 0.5) < 0.01 && miss.length === 1
@@ -1083,6 +1086,65 @@ function check(name, pass, detail) {
     check('AY 三来源全空时只打一条事实行', miss.length === 1
       && miss[0].indexOf('桥=') >= 0 && miss[0].indexOf('meta=') >= 0 && miss[0].indexOf('内联=') >= 0,
       `行数=${miss.length}`);
+  }
+
+  // ---------- AZ: 只有 #player-ads 横幅、时长就是正片 -> 不算广告态 ----------
+  // 现场（v1.4.6 第一份日志，+61699 起连续 30 秒）：
+  //   strong= true | adPlaying= true | .ad-showing= false | 覆盖层= #player-ads
+  //   | 玩家类= 无广告类(共23) | dur= 15591.5 | mainDur= 15591.5
+  // 一个伴生横幅把整段正片判成了广告态。v1.4.7 把它从覆盖层选择器里摘掉。
+  {
+    const html = `<div id="movie_player" class="html5-video-player"></div>
+      <div id="player-ads"></div>`;
+    const video = makeVideo(new JSDOM('').window, {
+      duration: 15591.5, currentTime: 11991.5, paused: false,
+    });
+    const { logs } = await loadPage(html, { video, debug: true });
+    await sleep(1500);
+    const beat = logs.filter((l) => l.indexOf('调试心跳') >= 0).pop() || '';
+    check('AZ 只有 #player-ads 横幅时不算广告态',
+      /strong= false/.test(beat) && /覆盖层= 无/.test(beat)
+      && !logs.some((l) => l.indexOf('检测到广告开始') >= 0),
+      beat.replace(/^\[YT-AutoSkip\]\s*/, '').slice(0, 130));
+  }
+
+  // ---------- BA: 桥答复晚到 -> 不许提前宣布"拿不到参照" ----------
+  // 现场（v1.4.6 第二份日志）：
+  //   +190951 ❓ 拿不到正片时长参照：… | 桥= 空值/1s前 | meta= 无 | 内联= 无脚本
+  //   +190958 🎯 正片时长参照取自页面桥…：mainDur= 303 s
+  // 7 毫秒后参照就到位了。那条"每个视频只说一次"的故障报告说的是件并不存在的事。
+  {
+    const html = `<div id="movie_player" class="html5-video-player"></div>`;
+    const opts = { duration: NaN, currentTime: 0, paused: false };
+    const video = makeVideo(new JSDOM('').window, opts);
+    const { win, player, logs } = await loadPage(html, { video, debug: true });
+    await sleep(300);
+    win.history.pushState({}, '', '/watch?v=newVideoId');
+    win.document.dispatchEvent(new win.Event('yt-navigate-finish'));
+    opts.duration = 1086.5;                            // 新视频的预播长广告
+    video.currentTime = 0.5;
+    player.classList.add('ad-showing');
+    await sleep(300);
+    bridgePush(win, 'newVideoId', [{ src: 'player.getPlayerResponse', id: 'newVideoId', dur: 1201 }]);
+    await sleep(1800);
+    const t = video.__getTime();
+    const cried = logs.some((l) => l.indexOf('❓ 拿不到正片时长参照') >= 0);
+    check('BA 桥答复晚到时不误报"拿不到参照"',
+      t > 1086 && !cried, `currentTime=${t.toFixed(2)}, 误报=${cried}`);
+  }
+
+  // ---------- BB: 贴尾卡住时 16× 只宣告一次 ----------
+  // 现场（v1.4.6 第一份日志）：同一句 `⏩ 广告卡在结尾不放，改用 16× 加速播放（rate=16）`
+  // 在 +50340 / +51390 / +52450 / +53514 打了 4 次 —— 速率早就是 16，重复的话只占缓冲。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const video = makeVideo(new JSDOM('').window, {
+      duration: 30, currentTime: 29.5, paused: false,
+    });
+    const { logs } = await loadPage(html, { video, debug: true });
+    await sleep(7000);                                  // 贴尾 3s 触发加速，再看它会不会重复喊
+    const lines = logs.filter((l) => l.indexOf('改用 16× 加速') >= 0).length;
+    check('BB 贴尾卡住时 16× 只宣告一次', lines === 1, `宣告行数=${lines}`);
   }
 
   const failed = results.filter((r) => !r.pass);

@@ -268,6 +268,24 @@
  *  - [日志] 三个来源全读不到时打一行 `❓ 拿不到正片时长参照`，逐项写清
  *    桥/meta/内联各自的状态（每个视频只一条）；心跳的 `playerCls` 换成
  *    `玩家类= ad-showing,ad-interrupting(共N)`，不再被截断吃掉关键类名
+ *
+ * v1.4.7：桥通了，剩下的是"信不信它的现场证据"
+ *  - [事实] 现场日志（v1.4.6，两份 49/45 行）第一次打出了
+ *    `🎯 正片时长参照取自页面桥（来源= player.getPlayerResponse）：mainDur= 303 s`，
+ *    而且同一 tick 内 3 支广告全走掉 —— 参照这条命脉终于通了
+ *  - [事实] 但同一 tick 里先打了一句 `❓ 拿不到正片时长参照 … 桥= 空值/1s前`，
+ *    7 毫秒后参照就到位了。桥是异步的，进广告那一刻问它本来就还没答；
+ *    这句"每个视频只说一次"的故障报告说的是件并不存在的事，比没有日志更糟
+ *  - [事实] 正片播放期间 `strong= true | adPlaying= true | .ad-showing= false
+ *    | 覆盖层= #player-ads | 玩家类= 无广告类 | dur == mainDur` 连续 30 秒 ——
+ *    `#player-ads` 是页面侧常驻伴生横幅，把整段正片判成了广告态
+ *  - [事实] 一支卡在结尾的广告把同一句 `改用 16× 加速播放` 打了 4 次
+ *  - [改动] `#player-ads` 移出 AD_OVERLAY_SELECTORS（弱信号不如没有信号）；
+ *    "没有 .ad-showing 的广告"改由 `.ad-interrupting` + 时长 ≠ 正片 判定
+ *  - [改动] `❓` 加 2.5s 宽限期（REF_DIAG_GRACE_MS），桥还没来得及答时不许宣布失败
+ *  - [改动] `桥=` 状态区分 `空值(getPlayerResponse没返回视频信息)` / `空值(无播放器API)`
+ *    / `id不符(adVideoId=27s)` —— 两种空值的修法完全不同
+ *  - [改动] 16× 加速只在首次真正加速时打一行，之后静默维持
  */
 (() => {
   'use strict';
@@ -278,7 +296,7 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.4.6'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.4.7'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
@@ -313,13 +331,20 @@
     '.ytp-ad-toggle-ui-dismiss button',
   ];
 
-  // 广告覆盖层信号：这些容器只在广告播放时存在，
+  // 广告覆盖层信号：这些容器只在**广告播放时**存在，
   // 出现在其中的"跳过"按钮一定是广告跳过按钮（快进插播广告常用）
+  //
+  // v1.4.7：**移除 `#player-ads`**。它是页面侧的常驻广告位（伴生横幅），
+  // 正片播放时也一直可见。现场（v1.4.6 第一份日志）坐实了危害：
+  //   `strong= true | adPlaying= true | .ad-showing= false | 覆盖层= #player-ads
+  //    | 玩家类= 无广告类(共23) | dur= 15591.5 | mainDur= 15591.5`
+  // 时长与正片一模一样、播放器一个广告类名都没挂，却因为一个横幅被判成广告态。
+  // "正片播放期间一直 strong=true" 会让心跳、findCloseButton 全程以为在广告里，
+  // 排查时也分不清真广告和横幅。宁可少一个弱信号，也不要一个恒真的信号。
   const AD_OVERLAY_SELECTORS = [
     '.ytp-ad-player-overlay',
     '.ytp-ad-player-overlay-skip-or-preview',
     '.ytp-ad-player-overlay-flyout-cta',
-    '#player-ads',
     '.ytp-ad-visit-advertiser-button',
     '.ytp-ad-overlay-container',
     '#ima3-container',
@@ -1203,6 +1228,10 @@
   // mainDur 还是 0（打开链接就先播广告）时两者都 false —— 没有参照就别动进度。
   const MAIN_DUR_TOLERANCE = 2;   // 秒。正片时长有小数/取整差异，留 2s 余量
   const MAIN_DUR_RETRY_MS = 3000; // v1.4.5：读不到正片参照时的重试间隔（miss 不缓存）
+  // v1.4.7：允许说"拿不到参照"之前的宽限期。桥（inj.js）是异步的，问出去到答复
+  // 回来要一两百毫秒，而进广告那一 tick 紧接着就问了一次 —— 不设宽限期就会在
+  // "答复正在路上"的时候宣布失败（现场真发生过，7ms 后参照就到了）。
+  const REF_DIAG_GRACE_MS = 2500;
   function mainClipLike(d) {
     return mainDur > 0 && isFinite(d) && Math.abs(d - mainDur) <= MAIN_DUR_TOLERANCE;
   }
@@ -1256,6 +1285,7 @@
   const bridge = {
     ever: false, at: 0, urlId: '', playing: '', cands: [], api: false, injectErr: '',
   };
+  let refAskedAt = 0;       // 最后一次"向桥要正片时长"的时间（决定 ❓ 能不能说出口）
 
   function installBridge() {
     try { window.addEventListener('message', onBridgeMsg, false); } catch (_) { /* ignore */ }
@@ -1286,6 +1316,7 @@
   }
 
   function askBridge() {
+    refAskedAt = Date.now();
     try { window.postMessage({ __ytas: BRIDGE_TAG, op: 'get' }, '*'); } catch (_) { /* ignore */ }
   }
 
@@ -1302,12 +1333,18 @@
   }
 
   // 桥的事实状态（写进日志，只陈述事实，不下结论）
+  // v1.4.7：把"没有候选"和"候选不是这支视频"分开写。现场（v1.4.6 第一份日志）
+  // 只有一句 `桥= 空值/0s前`，看不出是播放器没给数据，还是给了但 id 对不上 ——
+  // 这两件事的修法完全不同。
   function bridgeState() {
     if (bridge.injectErr) return bridge.injectErr;
     if (!bridge.ever) return '无响应';
     const age = Math.round((Date.now() - bridge.at) / 1000) + 's前';
-    if (!bridge.cands.length) return '空值' + (bridge.api ? '' : '(无播放器API)') + '/' + age;
-    return bridge.cands.map((c) => c.id + '=' + Math.round(c.dur * 10) / 10 + 's').join(',') + '/' + age;
+    if (!bridge.cands.length) {
+      return (bridge.api ? '空值(getPlayerResponse没返回视频信息)' : '空值(无播放器API)') + '/' + age;
+    }
+    const list = bridge.cands.map((c) => c.id + '=' + Math.round(c.dur * 10) / 10 + 's').join(',');
+    return (bridgePick() ? '' : 'id不符(') + list + (bridgePick() ? '' : ')') + '/' + age;
   }
 
   // 用桥上报的值补 mainDur（只在 mainDur 还空着时；跳一支广告不改变正片时长，
@@ -1367,11 +1404,18 @@
 
   function durFromPlayerResponse() { return inlineRes().dur; }
 
-  // "拿不到参照"这类事实每个视频只打一条 —— 现场最怕的就是一行废话刷满 500 行缓冲
+  // "拿不到参照"这类事实每个视频只打一条 —— 现场最怕的就是一行废话刷满 500 行缓冲。
+  // v1.4.7：但**不能进广告那一刻就打**。桥是异步的，现场（v1.4.6 第二份日志）就是这样：
+  //   +190951 ❓ 拿不到正片时长参照：… | 桥= 空值/1s前 | meta= 无 | 内联= 无脚本
+  //   +190958 🎯 正片时长参照取自页面桥（来源= player.getPlayerResponse）：mainDur= 303 s
+  // 7 毫秒后参照就到位了。这条"每个视频只说一次"的故障报告，说的是一件并不存在的事，
+  // 比没有日志更糟 —— 它会让人去修一个已经好了的东西。所以给它一个宽限期：
+  // 桥问出去 REF_DIAG_GRACE_MS 之后仍然全空，才允许说"拿不到"。
   let refDiagId = '';
   function logRefMissing() {
     const id = pageVideoId();
     if (refDiagId === id) return;
+    if (refAskedAt && Date.now() - refAskedAt < REF_DIAG_GRACE_MS) return;
     refDiagId = id;
     let inl = { state: '?' };
     try { inl = inlineRes(); } catch (_) { /* ignore */ }
@@ -1686,18 +1730,25 @@
 
       // seek 连续 2 次被忽略，或贴尾后等不到 ended → 改用 16× 加速，广告同样会迅速播完
       if (seekFails >= 2 || stuckAtEnd) {
+        // v1.4.7：已经加速过就**不要再喊一遍**。现场（v1.4.6 第一份日志）那支卡在结尾的
+        // 广告把同一句 `⏩ 广告卡在结尾不放，改用 16× 加速播放（rate=16）` 打了 4 次
+        // （+50340 / +51390 / +52450 / +53514）—— 它每次都被重新调用以维持跳转间隔，
+        // 但速率早就是 16 了，重复的话只是占日志缓冲。
+        const alreadyBoosted = v.playbackRate >= 8;
         videoSkipTimes.set(v, now);
         lastVideoSkip = now;
         try {
-          if (v.playbackRate < 8) {
+          if (!alreadyBoosted) {
             rateBoostPrev = v.playbackRate;   // 记住用户原本的速率，之后原样还回去
             v.playbackRate = 16;
           }
           rateBoostEl = v;
         } catch (_) { /* ignore */ }
-        dlog(stuckAtEnd
-          ? '⏩ 广告卡在结尾不放，改用 16× 加速播放（rate=' + v.playbackRate + '）'
-          : '⏩ seek 无效，改用 16× 加速播放广告（rate=' + v.playbackRate + '）');
+        if (!alreadyBoosted) {
+          dlog(stuckAtEnd
+            ? '⏩ 广告卡在结尾不放，改用 16× 加速播放（rate=' + v.playbackRate + '）'
+            : '⏩ seek 无效，改用 16× 加速播放广告（rate=' + v.playbackRate + '）');
+        }
         epochActed = true;
         return true;
       }
