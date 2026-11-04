@@ -1367,6 +1367,56 @@ function check(name, pass, detail) {
       `clicks=${clicks}, 抑制日志=${suppressed}, 熔断=${fuse}`);
   }
 
+  // ---------- BK: 媒体确已被摘（dur=NaN）时不再对空元素催流（v1.5.2）----------
+  // 现场（v1.5.1 日志，242 行）三个 8.4 秒慢 pod 的催流全紧跟
+  // `dur=NaN | ct=0 | readyState=0`：元素连媒体源都没有，play() 不会启动
+  // 资源加载，只把 paused 标志改一下。U 用例里 duration 仍有效（15），那条催流
+  // 必须保留 —— 两者不能一刀切。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const opts = { duration: 15, currentTime: 0.5, paused: false };
+    const video = makeVideo(new JSDOM('').window, opts);
+    let plays = 0;
+    video.play = () => { plays += 1; return Promise.resolve(); };
+    const { win, logs } = await loadPage(html, { video, debug: true });
+    await sleep(1200);                       // 已强跳到 14.4
+    const jumped = win.document.querySelector('video').__getTime();
+    const playsBefore = plays;
+    opts.readyState = 0;
+    opts.duration = NaN;                     // 流被摘走 —— 现场的 dur=NaN
+    opts.paused = true;                      // 同时被暂停（U 的触发条件）
+    await sleep(1600);
+    const skipped = logs.filter((l) => l.indexOf('空流跳过催流') >= 0).length;
+    const nudged = logs.filter((l) => l.indexOf('催流 play()') >= 0).length;
+    check('BK 媒体确已被摘（dur=NaN）时不再对空元素催流 play()',
+      jumped > 14 && playsBefore === 0 && plays === 0 && nudged === 0 && skipped >= 1,
+      `跳后 ct=${jumped.toFixed(2)}, play()=${plays}, 催流=${nudged}, 空流跳过=${skipped}`);
+  }
+
+  // ---------- BL: 贴尾空窗逐秒可观测，📊 单列"流被摘空窗"（v1.5.2）----------
+  // 现场那 8.4 秒里一行日志都没有，连 ".ad-showing 还在不在" 都无从判断。
+  // 空窗行必须自带 strong / dur / paused 事实，📊 必须把空窗从"等切流"里拆出来。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const opts = { duration: 15, currentTime: 0.5, paused: false };
+    const video = makeVideo(new JSDOM('').window, opts);
+    video.play = () => Promise.resolve();
+    const { win, logs } = await loadPage(html, { video, debug: true });
+    await sleep(1200);                       // 已贴尾
+    opts.readyState = 0;
+    opts.duration = NaN;                     // 摘流，进入空窗
+    await sleep(3600);                       // 空窗 > 2s，逐秒诊断该出现
+    const voidLogs = logs.filter((l) => l.indexOf('⏳ 贴尾空窗') >= 0);
+    const facts = voidLogs.length ? voidLogs[voidLogs.length - 1] : '';
+    win.document.querySelector('#movie_player').classList.remove('ad-showing');
+    await sleep(900);                        // 等 📊 广告结束
+    const summary = logs.filter((l) => l.indexOf('📊 广告结束') >= 0).join(' ');
+    check('BL 贴尾空窗逐秒可观测且 📊 单列空窗时长',
+      voidLogs.length >= 2 && /strong= true/.test(facts) && /dur= NaN/.test(facts)
+        && /流被摘空窗/.test(summary),
+      `空窗行=${voidLogs.length}, 末行=[${facts.slice(0, 110)}], 汇总=[${summary.slice(0, 130)}]`);
+  }
+
   const failed = results.filter((r) => !r.pass);
   console.log(`\n共 ${results.length} 项，通过 ${results.length - failed.length}，失败 ${failed.length}`);
   process.exit(failed.length ? 1 : 0);

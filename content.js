@@ -359,6 +359,24 @@
  *  - [改动] `tailState=1`（有流停在结尾）也不再点跳过按钮 —— 现场那 4 次点击
  *    全都无效，只换来一行熔断
  *  - [日志] `🚨 贴尾死等自救（第 N 次）`、`🕓 … 自救=N次`；`✅` / `🕓` 不再有"补发"
+ *
+ * v1.5.2：把"贴尾后流被摘"的 8 秒空窗量出来，并撤掉一个无效动作
+ *  - [事实] 现场日志（v1.5.1，242 行）7 次广告 pod / 14 支全部正常结束，
+ *    `📊 总` 最大 13249ms —— v1.5.0 那次 9347127ms（2.6 小时）卡死没有复现。
+ *    `🚨` 每支恰好 1 次（快路 700ms 采样），没有"第 2 次"；`🕓` 全程
+ *    `自救=1次 | paused=false | readyState=4 | rate=1`；`⏭️` 让点击预算保持 4
+ *  - [事实] 14 支共 68690ms（≈4.9s/支）。4 个 pod 的"贴尾后等切流"是
+ *    1179~1353ms（总 6.2~8.5s）；另外 3 个 pod 是 8385/8406/8458ms
+ *    （总 12.3~13.2s，占 72~78%）。三个数字几乎一样，像同一个固定超时
+ *  - [事实] 三个慢 pod 的时间线一致：`催流 play()` → `dur=NaN | ct=0 |
+ *    readyState=0` → `⏭️ 媒体已被摘` → 7~8 秒**一行日志都没有** → `📊 广告结束`；
+ *    四个正常 pod 全程没有催流行
+ *  - [改动] 空窗期逐秒记一行 `⏳ 贴尾空窗`（strong / readyState / dur / ct /
+ *    paused / 玩家类），`📊` 单列"流被摘空窗 Xms（最长 Yms）"。正片期零开销
+ *  - [改动] `duration` 无效（媒体确已被摘）时不再调 `play()`：无媒体源的
+ *    media element 不会因 play() 启动资源加载，这一下只改 paused 标志。
+ *    这是**排除干扰变量的受控实验**，不宣称能省掉那 8 秒；有效 duration 的
+ *    催流（U 用例）原样保留
  */
 (() => {
   'use strict';
@@ -369,7 +387,7 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.5.1'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.5.2'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
@@ -1357,6 +1375,17 @@
   // 留 12 秒够用；再久就说明已经进了别的状态，别拿旧结论当真。
   const TAIL_HOLD_MS = 12000;
 
+  // v1.5.2：`adCutoverWaitMs` 只说"贴尾后媒体没就绪"，但现场（v1.5.1 日志）里
+  // 那 8.4 秒空窗全程没有任何一行日志 —— 既看不出 .ad-showing 还在不在，
+  // 也看不出元素是"没源"还是"暂停"。这四个量 + 逐秒诊断把它变成可读的事实。
+  // 只在 tailState===2（流确已被摘）时累加，正片期和正常贴尾都不产生开销。
+  const TAIL_VOID_LOG_AFTER_MS = 2000;  // 空窗超过这么久才开始记（短切流不刷屏）
+  const TAIL_VOID_LOG_GAP_MS = 1000;    // 逐秒一行
+  let tailVoidRunMs = 0;                // 当前这段空窗已持续多久
+  let tailVoidTotalMs = 0;              // 本次广告累计
+  let tailVoidMaxMs = 0;                // 本次广告最长一段
+  let tailVoidLogAt = 0;
+
   // ---- v1.3.8：点击熔断与计数窗口 ----
   // 现场事故（v1.3.7）：广告态持续了 589 秒，期间我们每 4.2 秒点一次那个
   // "看得见但点了没用"的跳过按钮，一共点了 140 次，还把 500 行日志缓冲整个刷满，
@@ -1727,6 +1756,32 @@
     adCutoverWaitMs = 0;
     adMediaSampleAt = now;
     adMediaReadyDur = 0;
+    tailVoidRunMs = 0;
+    tailVoidTotalMs = 0;
+    tailVoidMaxMs = 0;
+    tailVoidLogAt = 0;
+  }
+
+  // v1.5.2：只在"已贴尾 + 流被摘 + 广告态还在"这段时间里量空窗。
+  // 日志只陈述事实，不下结论：strong / dur / ct / paused / 玩家类各自独立，
+  // 下一份现场日志要能据此分清"播放器还在等广告"还是"广告窗口其实已经关了"。
+  function noteTailVoid(v, now, dt) {
+    const voided = !!v && v.readyState < 1 && tailState(v, now) === 2;
+    if (!voided) { tailVoidRunMs = 0; return; }
+    tailVoidRunMs += dt;
+    tailVoidTotalMs += dt;
+    if (tailVoidRunMs > tailVoidMaxMs) tailVoidMaxMs = tailVoidRunMs;
+    if (tailVoidRunMs < TAIL_VOID_LOG_AFTER_MS) return;
+    if (tailVoidLogAt && now - tailVoidLogAt < TAIL_VOID_LOG_GAP_MS) return;
+    tailVoidLogAt = now;
+    const player = document.querySelector('#movie_player, .html5-video-player');
+    dlog('⏳ 贴尾空窗：已空', Math.round(tailVoidRunMs), 'ms',
+      '| strong=', adStateStrong(),
+      '| readyState=', v.readyState,
+      '| dur=', isFinite(v.duration) ? Math.round(v.duration * 10) / 10 : 'NaN',
+      '| ct=', isFinite(v.currentTime) ? Math.round(v.currentTime * 10) / 10 : 'NaN',
+      '| paused=', v.paused,
+      '| 玩家类=', playerClassFacts(player));
   }
 
   function markAdAction(now) {
@@ -1739,15 +1794,17 @@
   // 和被 200ms 最小等待、冷却窗口挡掉的时间完全不是一回事，必须分开计时。
   function sampleAdMedia(now) {
     const v = currentVideo();
-    if (!v) { adMediaSampleAt = now; return; }
+    if (!v) { noteTailVoid(null, now, 0); adMediaSampleAt = now; return; }
+    const dt = adMediaSampleAt ? now - adMediaSampleAt : 0;
     if (adMediaSampleAt && v.readyState < 1) {
-      const dt = now - adMediaSampleAt;
       adMediaWaitMs += dt;
       // v1.4.8：其中"我们已经贴尾，在等播放器换下一支流"的部分单独记一笔，
       // 让 📊 那一行能区分"等首支"和"等切流"——两者都是等待，但只有后者
       // 反复出现才说明 pod 里支数多，跟我们的实现无关。
       if (tailState(v, now) > 0) adCutoverWaitMs += dt;
     }
+    // v1.5.2：还要把"流确已被摘"的那段单独量出来（📊 会单列，空窗里逐秒记状态）
+    noteTailVoid(v, now, dt);
     adMediaSampleAt = now;
     if (v.readyState < 1) return;
     const dur = v.duration;
@@ -1774,6 +1831,17 @@
     // 浏览器本来就在取流，play() 是空操作；三次之后媒体照样 readyState=0 持续 8.5 秒。
     // 唯一有意义的情形是"贴尾后播放器把自己暂停了且没有流"，那才是 play() 能拉起来的。
     if (!v.paused) return false;
+    // v1.5.2：duration 无效 = 媒体源确已被摘走。此时 <video> 没有可用 resource，
+    // play() 不会启动资源加载算法，只把 paused 标志改一下 —— 现场（v1.5.1 日志）
+    // 三次催流全都紧跟 `dur=NaN | ct=0 | readyState=0`，之后照样空等 8.4 秒。
+    // 撤掉它作为受控实验；U 用例（duration 仍有效）的催流原样保留。
+    const dur = v.duration;
+    if (!isFinite(dur) || dur <= 0) {
+      dlogReject('voidNudge', '⏩ 空流跳过催流：dur=',
+        isFinite(dur) ? Math.round(dur * 10) / 10 : 'NaN',
+        '| readyState=', v.readyState, '| paused=', v.paused);
+      return false;
+    }
     const rec = nudgeTimes.get(v) || { n: 0, t: 0 };
     if (rec.n >= MEDIA_NUDGE_MAX) return false;
     if (now - rec.t < MEDIA_NUDGE_GAP) return false;
@@ -1787,7 +1855,8 @@
       if (p && typeof p.catch === 'function') p.catch(() => { /* 预期内，忽略 */ });
     } catch (_) { /* ignore */ }
     markAdAction(now);
-    dlog('⏩ 媒体未就绪且已贴尾，催流 play()（第', rec.n, '次 / 上限', MEDIA_NUDGE_MAX, '）');
+    dlog('⏩ 媒体未就绪且已贴尾，催流 play()（第', rec.n, '次 / 上限', MEDIA_NUDGE_MAX, '）',
+      '| dur=', Math.round(dur * 10) / 10, '| readyState=', v.readyState);
     return true;
   }
 
@@ -2534,6 +2603,11 @@
           adMediaWaitMs
             ? '（等首支 ' + firstWait + 'ms / 贴尾后等切流 ' + adCutoverWaitMs + 'ms，占 '
               + Math.round(adMediaWaitMs / total * 100) + '%）'
+            : '',
+          // v1.5.2：现场那 8.4 秒空窗以前只混在"贴尾后等切流"里，看不出是被摘流
+          tailVoidTotalMs
+            ? '| 流被摘空窗 ' + Math.round(tailVoidTotalMs) + 'ms（最长一段 '
+              + Math.round(tailVoidMaxMs) + 'ms）'
             : '');
         lastVskipWhy = '';
         // v1.3.8：只在"广告真的结束 + 结束前不久我们动过手"时计数。
