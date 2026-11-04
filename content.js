@@ -336,6 +336,29 @@
  *    判断也成立），再 dispatch `ended` 到同一个 <video>。每支广告只补一次
  *  - [改动] `✅` 那条不再被 adStateStrong() 静默吞掉（ended 晚于广告态消失就会被吃掉，
  *    日志于是说反话）；`🕓` 增加 `ended= 原生/补发/无 | paused= | readyState= | rate=`
+ *
+ * v1.5.1：回滚"补发 ended"—— 它把第 8 次广告卡死了 2.6 小时
+ *  - [事实] 现场日志（v1.5.0，452 行）前 7 次广告 14 支共 62.7 秒（≈4.5s/支），
+ *    `🧲 补发 ended` 每支都打出来了，`🕓` 也如实显示 `ended= 补发 |
+ *    paused=true | readyState=1` —— 但补发之后广告**照样要 2~4 秒才被切掉**：
+ *    合成事件和合成点击一样，YouTube 不认（铁律 2）
+ *  - [事故] 第 8 次广告的第二支（39.1s）从 +13341067 补发 ended 起，
+ *    `.ad-showing` 一直 true、`ct=39.1/dur=39.1` 纹丝不动，到 +22682004 才
+ *    `📊 广告结束：总 9347127 ms`。其间点了 4 次跳过按钮全部无效 → 🛑 熔断
+ *  - [根因] 补发时把 `currentTime` **精确钉在 dur**，元素冻在最后一帧、
+ *    paused=true，原生 ended 和 ad module 计时器一起停摆；补发的 ended 又被
+ *    `hookEnded` 记进 `endedSeenAt`，让 paused 分支永久 continue；点击预算耗尽；
+ *    残留看门狗只认正片量级时长也不触发 —— 所有自救手段被我们自己设的标志联合关掉
+ *  - [改动] 不再 dispatch 任何合成事件、不再把 ct 设成 dur。改成 `tailSelfHeal()`：
+ *    **拉回 `dur - TAIL_LEAD` + 续播**，留 0.6 秒媒体让原生 ended 有机会发出来；
+ *    先 seek 再 play，所以即便刚真的 ended 过也只播最后 0.6 秒，不会从头重放
+ *  - [改动] 看门狗排到 `v.paused` / `endedSeenAt` / 点击预算**之前**：
+ *    快路（700ms 采样到停滞且没有原生 ended）+ 硬兜底（贴尾满 8 秒无视一切标志）
+ *    共用 2.5s 节流；只在"还有媒体可走却没在走"（tailLeft > 0.25）时介入，
+ *    元素真到了 dur 就不插手（BF 守住这条线）
+ *  - [改动] `tailState=1`（有流停在结尾）也不再点跳过按钮 —— 现场那 4 次点击
+ *    全都无效，只换来一行熔断
+ *  - [日志] `🚨 贴尾死等自救（第 N 次）`、`🕓 … 自救=N次`；`✅` / `🕓` 不再有"补发"
  */
 (() => {
   'use strict';
@@ -346,7 +369,7 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.5.0'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.5.1'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
@@ -1201,11 +1224,14 @@
   // 两支广告因此白占 30 秒。留一点媒体让它真的走完，ended 才有机会发出来。
   const TAIL_LEAD = 0.6;         // 贴尾时预留的播放余量（秒）
   const TAIL_END_EPS = 0.25;     // 距片尾小于这个值就认为"已经到结尾，再加速没有意义"
-  // v1.5.0：贴尾后到底是"在走"还是"停着"必须量出来，不能靠等固定 3 秒。
+  // v1.5.0 保留：贴尾后到底是"在走"还是"停着"必须量出来，不能靠等固定 3 秒。
   // 现场（v1.4.9 日志）每支广告贴尾后 ct 只前进 0.3s / 2s（≈0.15×），
   // 说明元素卡在"最后 0.6 秒没有缓冲"上，而我们却一直等到 END_STALL_MS 才反应。
   const TAIL_STALL_MS = 700;     // 贴尾后每隔这么久采样一次播放位置
   const TAIL_STALL_RATE = 0.25;  // 窗口内有效速率低于 0.25× → 判定停滞（正常播放 ≥1×）
+  // v1.5.1：不再补发 ended，改成"停滞就重新落点 + 续播"的自救，并加硬兜底。
+  const TAIL_HEAL_GAP_MS = 2500;   // 两次自救的最小间隔
+  const TAIL_HEAL_HARD_MS = 8000;  // 贴尾这么久还没换流 → 无视一切标志强制破局
   let lastVideoSkip = 0;
   let mainDur = 0;               // 最近一次"非广告态"观察到的正片时长
   let adEndGuardUntil = 0;       // 广告刚结束的一小段时间内禁止动进度
@@ -1226,11 +1252,11 @@
   const endedHooked = new WeakSet();    // 已经挂过 ended 监听的 video 元素
   let endedSeenAt = 0;                  // 本次广告内收到 ended 的时间戳（0 = 没收到）
   let endedLogged = 0;                  // 上面那条日志每支只打一次
-  // v1.5.0：贴尾停滞采样 + "补发 ended"
+  // v1.5.1：贴尾停滞采样 + 自救（v1.5.0 的"补发 ended"已回滚，理由见 tailSelfHeal）
   let tailProbeAt = 0;                  // 上一窗口的采样时刻（0 = 不在采样）
   let tailProbeCt = 0;                  // 那一时刻的 currentTime
-  let fakeEndedAt = 0;                  // 本次广告内补发 ended 的时间（0 = 没补过，每支一次）
-  let endedSelfSent = false;            // 那个 ended 是我们补的，不是元素自己发的
+  let lastTailHealAt = 0;               // 上次自救时间（按广告重置）
+  let tailHealCount = 0;                // 本次广告内自救次数（日志用）
 
   // v1.4.9：给 video 挂一次 ended 监听，只为记录事实（不驱动任何动作）。
   // 现场最需要分清的两件事：元素到底有没有"播到结尾"，以及 YouTube 收到之后
@@ -1249,9 +1275,6 @@
         const nearTail = lastVideoSkip > 0 && at - lastVideoSkip <= TAIL_HOLD_MS;
         if (!strong && !nearTail) return;      // 正片播完的 ended，与广告无关
         endedSeenAt = at;
-        // 我们自己补发的那一个不能冒充"原生 ended"
-        const selfSent = fakeEndedAt > 0 && Math.abs(at - fakeEndedAt) < 150;
-        if (selfSent) { endedSelfSent = true; return; }
         if (endedLogged !== adScopedSeq) {
           endedLogged = adScopedSeq;
           dlog('✅ 广告收到原生 ended（贴尾后',
@@ -1274,36 +1297,41 @@
     // v1.5.0：这一行现在要能回答"为什么走不动" —— 是暂停、是没数据、还是速率被改了。
     // 光有 ct/dur 只能看出"慢了"，看不出慢在哪一层。
     dlog('🕓 贴尾等待换流：ct=', Math.round(ct * 10) / 10, '/ dur=', Math.round(dur * 10) / 10,
-      '| 已等', now - lastVideoSkip, 'ms | ended=',
-      endedSeenAt ? (endedSelfSent ? '补发' : '原生') : '无',
+      '| 已等', now - lastVideoSkip, 'ms | ended=', endedSeenAt ? '原生' : '无',
+      '| 自救=', tailHealCount, '次',
       '| paused=', v ? v.paused : '—', '| readyState=', v ? v.readyState : '—',
       '| rate=', v ? v.playbackRate : '—');
   }
 
-  // v1.5.0：贴尾之后如果元素"根本没在走"，就补一个 ended 出去。
-  // 现场（v1.4.9 日志，6 支广告）里每一次都是同一个形状：seek 落到 dur-0.6，
-  // 之后 2 秒只前进 0.3 秒（≈0.15×）——最后那 0.6 秒没有缓冲，元素卡住，
-  // 原生 ended 永远发不出来，ad module 于是只能等自己的计时器（每支 2.5~4.5 秒）。
-  // 我们已经把这支广告的播放位置放到了结尾，此刻补 ended 在语义上是成立的：
-  // 告诉播放器"这支到头了"，让它立刻换流。每支只补一次，YouTube 不认也无害。
-  function tryFakeEnded(v, dur, now) {
-    if (fakeEndedAt || !v) return false;
-    // 只在强广告态下补发。万一这支已经结束、<video> 已被正片接手，补 ended 会让
-    // 播放器以为"正片播完了"（直接跳片尾屏）—— 省几秒不值得冒这个险。
-    if (!adStateStrong()) return false;
-    fakeEndedAt = now;
-    let dispatched = false;
+  // v1.5.1：贴尾死等自救（替代 v1.5.0 的"补发 ended"，那一版把第 8 次广告卡死了
+  // 2.6 小时）。两条现场事实：
+  //   ① 合成 ended 和合成点击一样，YouTube 不认（铁律 2）——日志里补发之后广告
+  //      照样要 2~4 秒才被切掉，说明它没起任何作用；
+  //   ② 补发时把 currentTime 精确钉到 `dur`，元素被冻在最后一帧、paused=true，
+  //      原生 ended 和 ad module 的计时器一起停摆；再加上 endedSeenAt 让 paused
+  //      分支永久 continue、点击 4 次熔断，所有自救手段被我们自己联合关掉。
+  // 所以正确动作只有一个：把 playhead **拉回** `dur - TAIL_LEAD` 并续播，
+  // 让元素重新有媒体可走。不 dispatch 任何事件，不改播放速率。
+  function tailSelfHeal(v, dur, now) {
+    if (!v || !adStateStrong() || now - lastTailHealAt < TAIL_HEAL_GAP_MS) return false;
+    lastTailHealAt = now;
+    tailHealCount += 1;
+    const hadEnded = endedSeenAt > 0;
+    endedSeenAt = 0;             // 破自锁：让"贴尾但被暂停 → 续播"能重新生效
     try {
-      // ① playhead 精确落到结尾：ad module 若靠进度判断，也要它成立
-      if (isFinite(dur) && dur > 0 && v.currentTime < dur) v.currentTime = dur;
-      // ② 补发 ended —— 结束一支广告等的就是这个事件
-      dispatched = v.dispatchEvent(new Event('ended'));
+      v.currentTime = Math.max(0, dur - TAIL_LEAD);
+      // 先 seek 再 play：seek 会清掉元素的 ended 状态，所以即便刚真的 ended 过，
+      // play() 也只播最后 0.6 秒，不会从头重放整支广告。
+      if (v.paused) {
+        const p = v.play();
+        if (p && typeof p.catch === 'function') p.catch(() => { /* 预期内 */ });
+      }
     } catch (_) { /* ignore */ }
     markAdAction(now);
-    dlog('🧲 贴尾停滞：有效速率 <' + TAIL_STALL_RATE + '×（最后一段没缓冲），'
-      + '补发 ended | dur=', Math.round(dur * 10) / 10,
+    dlog('🚨 贴尾死等自救（第', tailHealCount, '次）：拉回 dur-0.6 + 续播',
+      '| dur=', Math.round(dur * 10) / 10,
       '| ct=', Math.round(v.currentTime * 10) / 10,
-      '| paused=', v.paused, '| readyState=', v.readyState, '| 已派发=', dispatched);
+      '| paused=', v.paused, '| readyState=', v.readyState, '| 原 ended=', hadEnded);
     return true;
   }
 
@@ -1667,7 +1695,8 @@
     endedLogged = 0;
     tailProbeAt = 0;
     tailProbeCt = 0;
-    fakeEndedAt = 0;
+    lastTailHealAt = 0;
+    tailHealCount = 0;
     durTooLongLogged = 0;
   }
 
@@ -1877,6 +1906,42 @@
 
       const atEnd = dur - ct < 1;
 
+      // ---- v1.5.1：贴尾看门狗（必须排在 v.paused / endedSeenAt / 点击预算 之前）----
+      // 现场（v1.5.0 日志 452 行）第 8 次广告卡死 2.6 小时：补发 ended 记下的
+      // endedSeenAt 让 paused 分支永久 continue，点击 4 次后熔断，残留看门狗又只认
+      // 正片量级时长 —— 所有自救手段被我们自己设的标志联合关掉了。
+      // 判据只认五件事实：强广告态（外层已保证）、已贴尾、媒体还在、时长不是正片、
+      // 而且**还有媒体可走却没在走**。元素真到了 dur 就别插手 —— 那时该由原生
+      // ended 接手，拉回来反而把播完的状态弄丢（BF 用例守住这条线）。
+      const tailLeft = isFinite(dur) ? dur - ct : 0;
+      const healable = atEnd && isFinite(dur) && dur > 0 && v.readyState >= 1
+        && tailLeft > TAIL_END_EPS && !mainClipLike(dur);
+      if (healable) {
+        const waited = lastVideoSkip ? now - lastVideoSkip : 0;
+        // 硬兜底：贴尾超过 8 秒还没换流，连"真的收到过原生 ended"也强制破局
+        const hardDue = waited >= TAIL_HEAL_HARD_MS;
+        if (!endedSeenAt || hardDue) {
+          if (!tailProbeAt) {
+            tailProbeAt = now;
+            tailProbeCt = ct;
+          } else if (now - tailProbeAt >= TAIL_STALL_MS) {
+            const winMs = now - tailProbeAt;
+            const moved = ct - tailProbeCt;
+            tailProbeAt = now;
+            tailProbeCt = ct;
+            // 按有效速率判，不按固定秒数：窗口会被 900ms 跳转间隔拉长
+            const stalled = moved < (winMs / 1000) * TAIL_STALL_RATE;
+            if ((stalled || hardDue) && tailSelfHeal(v, dur, now)) {
+              acted = true;
+              epochActed = true;
+              return true;
+            }
+          }
+        }
+      } else if (tailProbeAt) {
+        tailProbeAt = 0;   // 已经不在结尾 / 流被摘，采样作废
+      }
+
       // v1.3.4：广告已贴尾却被暂停 —— 播放器在等"广告结束/切下一支"的指令，
       // 网络或广告服务一慢就会长时间挂着（现场日志：跳完 27.8s 那支后，过了 9.2s
       // 才切到下一支，期间 tick 全被 "暂停中不动进度" 静默挡掉）。
@@ -1929,28 +1994,6 @@
       // v1.4.9：只剩"到结尾还有媒体可走"这一种情况才值得加速。
       // 现场（v1.4.8 日志）两次 16× 都是在 ct == dur 之后开的 —— 元素已经在最后一帧，
       // 加速不改变任何时间，只把 playbackRate 改成一个更奇怪的值。
-      const tailLeft = isFinite(dur) ? dur - ct : 0;
-
-      // v1.5.0：先量"有没有在走"，再决定要不要继续等。
-      // 旧逻辑是"贴尾满 3 秒 → 开 16×"，可现场那个 3 秒纯属白等：16× 开启后
-      // 广告照样要 0.4~0.8 秒才被切掉，说明慢的不是"播放速度"而是"ad module 的计时器"。
-      // 这里改成每 TAIL_STALL_MS 采样一次播放位置，一旦发现"基本没动"就立刻补 ended。
-      if (atEnd) {
-        if (!tailProbeAt) {
-          tailProbeAt = now;
-          tailProbeCt = ct;
-        } else if (now - tailProbeAt >= TAIL_STALL_MS) {
-          const winMs = now - tailProbeAt;
-          const moved = ct - tailProbeCt;
-          tailProbeAt = now;
-          tailProbeCt = ct;
-          // 用"有效速率"判定，不认固定秒数：窗口可能是 700ms，也可能被跳转间隔拉到 900ms
-          if (moved < (winMs / 1000) * TAIL_STALL_RATE) tryFakeEnded(v, dur, now);
-        }
-      } else if (tailProbeAt) {
-        tailProbeAt = 0;   // 已经不在结尾了（换支/被重置），采样作废
-      }
-
       const stuckAtEnd = atEnd && now - endStallSince >= END_STALL_MS && tailLeft > TAIL_END_EPS;
 
       // seek 连续 2 次被忽略，或贴尾后等不到 ended → 改用 16× 加速，广告同样会迅速播完
@@ -2529,10 +2572,14 @@
     // 的旧 UI，点下去既无效又白吃 CLICK_BUDGET。现场 v1.4.7 日志里 4 次点击全部
     // 落在这个窗口（dur=NaN / readyState=0），第二支广告还没开始预算就用完了。
     const tailNow = skipBtn ? tailState(currentVideo(), Date.now()) : 0;
-    if (skipBtn && tailNow === 2) {
+    if (skipBtn && tailNow > 0) {
       if (tailSkipLogged !== adScopedSeq) {
         tailSkipLogged = adScopedSeq;
-        dlog('⏭️ 媒体已被摘（贴尾切流中），跳过按钮不点 | 剩余点击预算=', clickBudget);
+        // v1.5.1：档 1（有流停在结尾）以前照点，现场（v1.5.0 日志第 8 次）证明
+        // 那 4 次点击全部无效，只换来一行 🛑 熔断和 2.6 小时的死等。我们已经把
+        // 这支推到结尾了，按钮的作用就是"跳到结尾"，点了没有任何收益。
+        dlog('⏭️', tailNow === 2 ? '媒体已被摘（贴尾切流中）' : '已贴尾，按钮作用已达成',
+          '，跳过按钮不点 | 剩余点击预算=', clickBudget);
       }
     } else if (skipBtn) {
       // 跳过按钮是"强广告态下"找到的，延迟期间广告可能已结束/元素被复用，

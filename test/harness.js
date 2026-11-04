@@ -265,7 +265,12 @@ function check(name, pass, detail) {
     const html = `<div id="movie_player" class="html5-video-player ad-showing">
         <div id="safe-host"></div>
       </div>`;
-    const video = makeVideo(new JSDOM('').window, { duration: 15, currentTime: 0.5, paused: false });
+    // v1.5.1：让 seek 一直无效，视频停在起播点（tailState=0）。否则按钮被深扫
+    // 找到时早已贴尾，而"已贴尾就不点按钮"是本版刻意加的规则 —— H 要测的是
+    // shadow 跨边界可见性/可点击性，不该被贴尾抑制吃掉，得把两种场景分开。
+    const video = makeVideo(new JSDOM('').window, {
+      duration: 15, currentTime: 0.5, paused: false, seekable: false,
+    });
     const { win } = await loadPage(html, { video });
     const host = win.document.getElementById('safe-host');
     const shadow = host.attachShadow({ mode: 'open' });
@@ -1157,21 +1162,24 @@ function check(name, pass, detail) {
       t > 1085 && !cried, `currentTime=${t.toFixed(2)}, 误报=${cried}`);
   }
 
-  // ---------- BB: 贴尾停滞时补发 ended 一次，且不再靠 16×（v1.5.0）----------
-  // 现场（v1.4.9 日志）：每支广告 seek 到 dur-0.6 之后，2 秒只前进 0.3 秒（≈0.15×），
-  // 最后一段没有缓冲 → 原生 ended 永远不来。v1.4.9 对此的反应是"等 3 秒开 16×"，
-  // 而 16× 之后广告照样要 0.4~0.8 秒才切，说明那 3 秒纯属白等。
+  // ---------- BB: 贴尾停滞会自救，playhead 绝不被钉在 dur（v1.5.1）----------
+  // 现场（v1.5.0 日志 452 行）第 8 次广告卡死 2.6 小时，直接原因就是补发 ended 时
+  // 把 currentTime 精确设成了 dur：元素冻在最后一帧、paused=true，原生 ended 和
+  // ad module 的计时器一起停摆。新版只做"拉回 dur-0.6 + 续播"，不派发任何合成事件。
   {
     const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
     const video = makeVideo(new JSDOM('').window, {
       duration: 30, currentTime: 29.5, paused: false,
     });
+    let endedDispatched = 0;
+    video.addEventListener('ended', () => { endedDispatched += 1; });
     const { logs } = await loadPage(html, { video, debug: true });
     await sleep(7000);
-    const marks = logs.filter((l) => l.indexOf('🧲') >= 0).length;
-    const boosts = logs.filter((l) => l.indexOf('改用 16× 加速') >= 0).length;
-    check('BB 贴尾停滞时补发 ended 一次，且不再喊 16×',
-      marks === 1 && boosts === 0, `🧲行数=${marks}, 16×宣告=${boosts}`);
+    const heals = logs.filter((l) => l.indexOf('🚨') >= 0).length;
+    const ct = video.__getTime();
+    check('BB 贴尾停滞会自救，不派发合成 ended，playhead 不钉在 dur',
+      heals >= 1 && endedDispatched === 0 && Math.abs(ct - 29.4) < 0.2,
+      `自救=${heals}, 合成ended=${endedDispatched}, ct=${ct.toFixed(2)}`);
   }
 
   // ---------- BB2: seek 一直被忽略时才走 16×，且只宣告一次（v1.5.0 保留去重）----------
@@ -1272,27 +1280,32 @@ function check(name, pass, detail) {
       `playbackRate=${el.playbackRate}, 加速日志=${boosted}`);
   }
 
-  // ---------- BG: 贴尾停滞时补发的 ended 真的送达元素（v1.5.0）----------
-  // 这一条只验"我们确实把这个事件发出去了、而且落到同一个 <video> 上"，
-  // 至于 YouTube 认不认，只能靠现场日志里广告结束的时间来判断。
+  // ---------- BG: 贴尾停滞时自救会唤醒暂停元素，且不派发合成 ended（v1.5.1）----------
+  // 现场（v1.5.0）：补发 ended 后元素一律 paused=true / readyState=1。
+  // 新版唯一动作是"拉回 dur-0.6 + play()"：留一点媒体让它自己走完发原生 ended。
   {
     const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
-    const video = makeVideo(new JSDOM('').window, { duration: 15, currentTime: 0.5, paused: false });
-    let endedSeen = 0;
-    video.addEventListener('ended', () => { endedSeen += 1; });
+    const opts = { duration: 15, currentTime: 0.5, paused: false };
+    const video = makeVideo(new JSDOM('').window, opts);
+    let plays = 0;
+    let endedDispatched = 0;
+    video.play = () => { plays += 1; opts.paused = false; return Promise.resolve(); };
+    video.addEventListener('ended', () => { endedDispatched += 1; });
     const { win, logs } = await loadPage(html, { video, debug: true });
-    await sleep(2800);                     // 强跳 → 0.7s 采样判停滞 → 补发
+    await sleep(1600);                     // 已强跳到 14.4
+    opts.paused = true;                    // 现场：贴尾后播放器把元素 pause 了
+    await sleep(2000);                     // 越过 700ms 采样
     const el = win.document.querySelector('video');
-    const marks = logs.filter((l) => l.indexOf('🧲') >= 0).length;
-    const selfMark = logs.filter((l) => l.indexOf('补发') >= 0).length;
-    check('BG 贴尾停滞时补发 ended（一次，且 playhead 落到 dur）',
-      marks === 1 && endedSeen >= 1 && Math.abs(el.__getTime() - 15) < 0.01,
-      `🧲行数=${marks}, 收到 ended=${endedSeen}, ct=${el.__getTime()}, 补发标记=${selfMark}`);
+    const heals = logs.filter((l) => l.indexOf('🚨') >= 0).length;
+    check('BG 贴尾停滞时自救：续播 + 拉回 dur-0.6，不派发合成 ended',
+      heals >= 1 && plays >= 1 && endedDispatched === 0
+        && Math.abs(el.__getTime() - 14.4) < 0.2,
+      `自救=${heals}, play()=${plays}, 合成ended=${endedDispatched}, ct=${el.__getTime().toFixed(2)}`);
   }
 
-  // ---------- BH: 贴尾仍在正常推进时**不**补发 ended（v1.5.0）----------
-  // 补发是"元素停住"的对策，不是见尾就发。这里模拟 ~0.4× 的推进（视频在走、
-  // 只是慢），补发一旦触发就说明判据写成了"见尾即发"。
+  // ---------- BH: 贴尾仍在正常推进时**不**自救（v1.5.1）----------
+  // 自救是"元素停住"的对策，不是见尾就发。这里模拟 ~0.4× 的推进（视频在走、
+  // 只是慢），自救一旦触发就说明判据写成了"见尾即救"。
   {
     const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
     const video = makeVideo(new JSDOM('').window, { duration: 20, currentTime: 0.5, paused: false });
@@ -1304,9 +1317,54 @@ function check(name, pass, detail) {
     }, 100);                               // ≈0.4×
     await sleep(1000);
     clearInterval(timer);
-    const marks = logs.filter((l) => l.indexOf('🧲') >= 0).length;
-    check('BH 贴尾仍在推进时不补发 ended（补发只对"停住"生效）',
-      marks === 0, `🧲行数=${marks}, ct=${el.__getTime().toFixed(2)}`);
+    const marks = logs.filter((l) => l.indexOf('🚨') >= 0).length;
+    check('BH 贴尾仍在推进时不自救（自救只对"停住"生效）',
+      marks === 0, `🚨行数=${marks}, ct=${el.__getTime().toFixed(2)}`);
+  }
+
+  // ---------- BI: "已 ended + 暂停 + 预算耗尽"时，8 秒硬兜底仍能破局（v1.5.1）----------
+  // 这是 v1.5.0 那次 2.6 小时卡死的精确复现（时钟压缩到 8 秒）：
+  // endedSeenAt 让 paused 分支永久 continue、点击 4 次熔断、残留看门狗只认
+  // 正片量级时长 —— 所有自救手段被我们自己设的标志联合关掉。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const opts = { duration: 20, currentTime: 0.5, paused: false };
+    const video = makeVideo(new JSDOM('').window, opts);
+    let plays = 0;
+    video.play = () => { plays += 1; opts.paused = false; return Promise.resolve(); };
+    const { win, logs } = await loadPage(html, { video, debug: true });
+    await sleep(1600);                     // 已强跳到 19.4
+    const el = win.document.querySelector('video');
+    opts.paused = true;
+    el.dispatchEvent(new win.Event('ended'));   // 自锁标志：paused 分支从此 continue
+    await sleep(9200);                     // 越过 TAIL_HEAL_HARD_MS=8000
+    const heals = logs.filter((l) => l.indexOf('🚨') >= 0).length;
+    check('BI 已 ended 且暂停时，8 秒硬兜底仍能破局（防 2.6 小时卡死）',
+      heals >= 1 && plays >= 1 && Math.abs(el.__getTime() - 19.4) < 0.2,
+      `自救=${heals}, play()=${plays}, ct=${el.__getTime().toFixed(2)}`);
+  }
+
+  // ---------- BJ: 有流停在结尾（tailState=1）时不再空点跳过按钮（v1.5.1）----------
+  // 现场（v1.5.0 第 8 次广告）：补发 ended 后又点了 4 次，全部无效，只换来一行
+  // 🛑 熔断。我们已经把这支推到结尾，按钮的作用就是"跳到结尾"，没有收益。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 20, currentTime: 0.5, paused: false });
+    const { win, logs } = await loadPage(html, { video, debug: true });
+    await sleep(1400);                     // 已贴尾
+    const btn = win.document.createElement('button');
+    btn.className = 'ytp-skip-ad-button';
+    btn.setAttribute('aria-label', '跳过广告');
+    btn.textContent = '跳过广告';
+    let clicks = 0;
+    btn.addEventListener('click', () => { clicks += 1; });
+    win.document.querySelector('#movie_player').appendChild(btn);
+    await sleep(3200);
+    const suppressed = logs.filter((l) => l.indexOf('已贴尾，按钮作用已达成') >= 0).length;
+    const fuse = logs.filter((l) => l.indexOf('🛑') >= 0).length;
+    check('BJ 有流停在结尾时不再点按钮（不白吃预算、不熔断）',
+      clicks === 0 && suppressed >= 1 && fuse === 0,
+      `clicks=${clicks}, 抑制日志=${suppressed}, 熔断=${fuse}`);
   }
 
   const failed = results.filter((r) => !r.pass);
