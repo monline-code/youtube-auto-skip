@@ -302,6 +302,26 @@
  *  - [改动] 📊 把"媒体未就绪"拆成 `等首支` / `贴尾后等切流`：v1.4.7 那个 86%
  *    里 15.5 秒是等切流（跟 pod 支数成正比），只有 1.2 秒是真在等第一支挂载。
  *    混成一个数，这指标就没法用来判断"还值不值得优化"
+ *
+ * v1.4.9：强跳是成功的 —— 用户还是看了 30 秒，问题在"贴尾之后"
+ *  - [事实] 现场日志（v1.4.8，97 行）里 `⏭️ 媒体已被摘…不点` 生效、预算没再被烧，
+ *    `📊 总 30444ms | 强跳 2 次 | 等首支 2436ms / 贴尾后等切流 16617ms（63%）`
+ *  - [事实] 但两支广告的 ct 都精确贴到 dur（26/26、400.3/400.4），用户仍然看了 30 秒。
+ *    拆开看：tag 到片尾之后元素**停在最后一帧不发 ended**，播放器自己 pause，
+ *    我们只能等 ad module 的计时器超时（每支 5~7 秒）
+ *  - [事实] 那两次 16× 都是在 `ct == dur` 之后开的 —— 已经在最后一帧，加速不改变任何
+ *    时间，只把 playbackRate 改成一个更奇怪的值；而且它写 `videoSkipTimes` 之后，
+ *    紧接着把"贴尾暂停 → 续播"挡成了「刚催过」（+5501826）
+ *  - [改动] 贴尾落点 `dur - 0.05` → `dur - 0.6`（TAIL_LEAD）：留一点媒体让它真的
+ *    走完并发出**原生 ended**，而不是停在"结尾前一瞬"永远等不到
+ *  - [改动] 贴尾后若元素是暂停的，立刻 play()（不节流）—— 停在尾部的暂停元素
+ *    永远不会播到结束
+ *  - [改动] 16× 只在"离结尾还有媒体可走"（tailLeft > 0.25）时开；`stuckAtEnd` 不再
+ *    在 `ct == dur` 时触发
+ *  - [改动] 收到过 ended 就不再续播（对 ended 的元素 play() 会从头重放，等于把广告
+ *    再看一遍）
+ *  - [日志] 新增 `✅ 广告收到原生 ended（贴尾后 Xms）` 和 `🕓 贴尾等待换流 … ended 收到=`
+ *    —— 下次一眼能分清"元素没播完（seek 落点问题）"和"播完了但 YouTube 不换流"
  */
 (() => {
   'use strict';
@@ -312,7 +332,7 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.4.8'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.4.9'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
@@ -1161,6 +1181,12 @@
   const AD_SKIP_CONFIRM_MS = 800;  // 无法证明"不是正片"时（mainDur 未知）必须等满的确认窗口
   const VIDEO_SKIP_GAP = 900;    // 同一 video 元素最小间隔
   const END_STALL_MS = 3000;     // 贴到结尾却迟迟不结束时，多久后改用加速
+  // v1.4.9：贴尾不再推到 `dur - 0.05`，而是留 TAIL_LEAD 秒。
+  // 现场（v1.4.8 日志）强跳本身是成功的（ct 精确到 dur），但元素停在"结尾前一瞬"
+  // 从不触发原生 ended，播放器只能自己 pause，然后靠 ad module 的计时器慢慢换流 ——
+  // 两支广告因此白占 30 秒。留一点媒体让它真的走完，ended 才有机会发出来。
+  const TAIL_LEAD = 0.6;         // 贴尾时预留的播放余量（秒）
+  const TAIL_END_EPS = 0.25;     // 距片尾小于这个值就认为"已经到结尾，再加速没有意义"
   let lastVideoSkip = 0;
   let mainDur = 0;               // 最近一次"非广告态"观察到的正片时长
   let adEndGuardUntil = 0;       // 广告刚结束的一小段时间内禁止动进度
@@ -1176,6 +1202,45 @@
   let endStallSince = 0;         // 广告贴在尾部不动的起始时间戳（0 = 未卡住）
   let videoSkipTimes = new WeakMap();   // video -> 上次跳转时间（同样按广告重置）
   let lastJumpDur = 0;                  // 上一次强跳的视频时长，用于认出 pod 里的下一支
+  // v1.4.9：贴尾后到底有没有发出原生 ended —— 这一条决定"等这么久"该怪谁。
+  // 装了监听不代表会打日志：只有贴尾后真的收到 ended 才记一行，广告期间限一次。
+  const endedHooked = new WeakSet();    // 已经挂过 ended 监听的 video 元素
+  let endedSeenAt = 0;                  // 本次广告内收到 ended 的时间戳（0 = 没收到）
+  let endedLogged = 0;                  // 上面那条日志每支只打一次
+
+  // v1.4.9：给 video 挂一次 ended 监听，只为记录事实（不驱动任何动作）。
+  // 现场最需要分清的两件事：元素到底有没有"播到结尾"，以及 YouTube 收到之后
+  // 花了多久才换流。前者只能靠 ended 证明，靠 ct 猜是猜不出来的。
+  function hookEnded(v) {
+    if (!v || endedHooked.has(v)) return;
+    endedHooked.add(v);
+    try {
+      v.addEventListener('ended', () => {
+        if (!adStateStrong()) return;      // 正片播完也会 ended，与广告无关
+        const at = Date.now();
+        endedSeenAt = at;
+        if (endedLogged !== adScopedSeq) {
+          endedLogged = adScopedSeq;
+          dlog('✅ 广告收到原生 ended（贴尾后',
+            lastVideoSkip ? (at - lastVideoSkip) + 'ms' : '—', '）');
+        }
+      });
+    } catch (_) { /* ignore */ }
+  }
+
+  // v1.4.9：贴到尾之后我们已经无事可做，等的是 YouTube 换流。把这层等待连同它的
+  // 成因写进日志（每支一条）：ended 收到=是 → 元素确实播完了，慢在 ad module；
+  // ended 收到=否 → 元素没播到结尾，问题在 seek 落点（TAIL_LEAD 要调）。
+  function noteTailWait(now) {
+    if (tailWaitLogged === adScopedSeq) return;
+    if (!lastVideoSkip || now - lastVideoSkip < 2000) return;
+    const v = currentVideo();
+    const ct = v && isFinite(v.currentTime) ? v.currentTime : NaN;
+    const dur = v && isFinite(v.duration) ? v.duration : NaN;
+    tailWaitLogged = adScopedSeq;
+    dlog('🕓 贴尾等待换流：ct=', Math.round(ct * 10) / 10, '/ dur=', Math.round(dur * 10) / 10,
+      '| 已等', now - lastVideoSkip, 'ms | ended 收到=', endedSeenAt > 0);
+  }
 
   // ---- v1.3.5：广告耗时归因 ----
   // 现场日志（v1.3.4）里"广告开始 → 广告结束"整整 18.2 秒，但里面只有 1.8 秒
@@ -1208,6 +1273,7 @@
   let clickBudget = CLICK_BUDGET;       // 剩余可点击次数（每次广告/换支重置）
   let clickBudgetWarned = false;        // "熔断"那条日志只打一次
   let tailSkipLogged = 0;               // "已贴尾，不点按钮"那条日志每支只打一次（v1.4.8）
+  let tailWaitLogged = 0;               // "贴尾等待换流"那条日志每支只打一次（v1.4.9）
   let adLastActionAt = 0;               // 本次广告内最后一次真的动手的时间
   let durTooLongLogged = 0;             // 已经解释过"时长超过 AD_MAX_DURATION"的那个时长
 
@@ -1531,6 +1597,9 @@
     clickBudget = CLICK_BUDGET;
     clickBudgetWarned = false;
     tailSkipLogged = 0;
+    tailWaitLogged = 0;
+    endedSeenAt = 0;
+    endedLogged = 0;
     durTooLongLogged = 0;
   }
 
@@ -1749,11 +1818,15 @@
       // 保留它只为"媒体已就绪但播放器暂停"这种真实情况。
       if (v.paused) {
         if (!atEnd) { why = why || 'paused'; continue; }
+        // v1.4.9：已经收到过原生 ended 就**别再续播**。按规范，对 ended 的元素调
+        // play() 会从头重新播放 —— 那等于让用户把广告再看一遍。此刻唯一该做的是
+        // 等 YouTube 换流（🕓 那行会记下等了多久）。
+        if (endedSeenAt) { why = why || '贴尾且已 ended，等换流'; noteTailWait(now); continue; }
         const t2 = videoSkipTimes.get(v);
         if (t2 && now - t2 < VIDEO_SKIP_GAP) { why = why || '贴尾暂停（刚催过）'; continue; }
         videoSkipTimes.set(v, now);
         lastVideoSkip = now;
-        try { v.currentTime = Math.max(0, dur - 0.05); } catch (_) { /* ignore */ }
+        try { v.currentTime = Math.max(0, dur - TAIL_LEAD); } catch (_) { /* ignore */ }
         try { v.play(); } catch (_) { /* ignore */ }
         acted = true;
         markAdAction(now);
@@ -1785,7 +1858,11 @@
       } else if (endStallSince) {
         endStallSince = 0;
       }
-      const stuckAtEnd = atEnd && now - endStallSince >= END_STALL_MS;
+      // v1.4.9：只剩"到结尾还有媒体可走"这一种情况才值得加速。
+      // 现场（v1.4.8 日志）两次 16× 都是在 ct == dur 之后开的 —— 元素已经在最后一帧，
+      // 加速不改变任何时间，只把 playbackRate 改成一个更奇怪的值。
+      const tailLeft = isFinite(dur) ? dur - ct : 0;
+      const stuckAtEnd = atEnd && now - endStallSince >= END_STALL_MS && tailLeft > TAIL_END_EPS;
 
       // seek 连续 2 次被忽略，或贴尾后等不到 ended → 改用 16× 加速，广告同样会迅速播完
       if (seekFails >= 2 || stuckAtEnd) {
@@ -1794,7 +1871,8 @@
         // （+50340 / +51390 / +52450 / +53514）—— 它每次都被重新调用以维持跳转间隔，
         // 但速率早就是 16 了，重复的话只是占日志缓冲。
         const alreadyBoosted = v.playbackRate >= 8;
-        videoSkipTimes.set(v, now);
+        // v1.4.9：不再写 videoSkipTimes —— 加速并没有改变播放位置，把它记成"刚跳过"
+        // 会紧接着挡住下一条"贴尾暂停 → 续播"（现场 +5501826 的「刚催过」就是这么来的）。
         lastVideoSkip = now;
         try {
           if (!alreadyBoosted) {
@@ -1813,7 +1891,10 @@
       }
 
       // 正常贴尾：交给播放器自己发 ended，不要反复 seek
-      if (atEnd) continue;
+      if (atEnd) {
+        noteTailWait(now);
+        continue;
+      }
 
       videoSkipTimes.set(v, now);
       lastVideoSkip = now;
@@ -1825,12 +1906,22 @@
           lastJumpDur = dur;
           resetAdScopedState();
         }
-        jumpTarget = Math.max(0, dur - 0.05);
+        jumpTarget = Math.max(0, dur - TAIL_LEAD);
         jumpEl = v;
         jumpDur = dur;
         jumpProvisional = early;
         if (early) earlySeeks += 1;
+        hookEnded(v);                 // v1.4.9：记录"元素到底有没有播到结尾"
         v.currentTime = jumpTarget;
+        // v1.4.9：贴尾后**必须确保它在放**。停在 `dur - TAIL_LEAD` 的暂停元素永远不会
+        // 走到结尾、永远不会发 ended；现场那 5 秒空等就是这么来的（paused=true 一直
+        // 挂到 ad module 自己超时）。这里不节流，因为我们刚刚亲手移动了它。
+        if (v.paused) {
+          try {
+            const p = v.play();
+            if (p && typeof p.catch === 'function') p.catch(() => { /* 预期内 */ });
+          } catch (_) { /* ignore */ }
+        }
         adJumpCount += 1;
         markAdAction(now);
         // v1.4.1：长广告动手了就留痕。这一行是"300s 判正片"被推翻的直接证据，

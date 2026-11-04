@@ -937,7 +937,7 @@ function check(name, pass, detail) {
     const t = video.__getTime();
     const metaLog = logs.some((l) => l.indexOf('正片时长参照取自页面') >= 0);
     check('AQ 没有 mainDur 时用页面元数据当正片参照',
-      t > 1086 && metaLog, `currentTime=${t.toFixed(2)}, 元数据日志=${metaLog}`);
+      t > 1085 && metaLog, `currentTime=${t.toFixed(2)}, 元数据日志=${metaLog}`);
   }
 
   // ---------- AR: 元数据时长就是当前媒体 -> 仍然不动（AQ 的安全边界）----------
@@ -970,7 +970,7 @@ function check(name, pass, detail) {
     await sleep(1800);
     const t1 = video.__getTime();
     check('AS1 同一视频重发导航事件不作废 mainDur（广告照样跳）',
-      t1 > 1086, `currentTime=${t1.toFixed(2)}`);
+      t1 > 1085, `currentTime=${t1.toFixed(2)}`);
     // 换视频：pushState 改 id 后再发导航事件 -> 参照必须作废
     win.history.pushState({}, '', '/watch?v=otherVideoId');
     win.document.dispatchEvent(new win.Event('yt-navigate-finish'));
@@ -1005,7 +1005,7 @@ function check(name, pass, detail) {
     const t = video.__getTime();
     const srcLog = logs.some((l) => l.indexOf('内联playerResponse') >= 0);
     check('AT 没有 meta 时用 playerResponse 的正片时长（id 校验）',
-      t > 1086 && srcLog, `currentTime=${t.toFixed(2)}, 来源日志=${srcLog}`);
+      t > 1085 && srcLog, `currentTime=${t.toFixed(2)}, 来源日志=${srcLog}`);
   }
 
   // ---------- AU: playerResponse 属于别的视频 -> 不采用（AT 的安全边界）----------
@@ -1043,7 +1043,7 @@ function check(name, pass, detail) {
     await sleep(5000);
     const after = video.__getTime();
     check('AV 参照晚到时边播边等，补上后仍强跳',
-      Math.abs(before - 0.5) < 0.01 && after > 1086, `之前=${before.toFixed(2)}, 之后=${after.toFixed(2)}`);
+      Math.abs(before - 0.5) < 0.01 && after > 1085, `之前=${before.toFixed(2)}, 之后=${after.toFixed(2)}`);
   }
 
   // ---------- AW: 页面桥补上正片参照 -> 长广告照样跳 ----------
@@ -1067,7 +1067,7 @@ function check(name, pass, detail) {
     const t = video.__getTime();
     const gotRef = logs.some((l) => l.indexOf('🎯 正片时长参照取自页面桥') >= 0);
     check('AW 页面桥补上参照后长广告照跳',
-      t > 1086 && gotRef, `currentTime=${t.toFixed(2)}, 桥参照日志=${gotRef}`);
+      t > 1085 && gotRef, `currentTime=${t.toFixed(2)}, 桥参照日志=${gotRef}`);
   }
 
   // ---------- AX: 桥报的是广告自己的 playerResponse -> 不采用（AT 的安全边界）----------
@@ -1154,7 +1154,7 @@ function check(name, pass, detail) {
     const t = video.__getTime();
     const cried = logs.some((l) => l.indexOf('❓ 拿不到正片时长参照') >= 0);
     check('BA 桥答复晚到时不误报"拿不到参照"',
-      t > 1086 && !cried, `currentTime=${t.toFixed(2)}, 误报=${cried}`);
+      t > 1085 && !cried, `currentTime=${t.toFixed(2)}, 误报=${cried}`);
   }
 
   // ---------- BB: 贴尾卡住时 16× 只宣告一次 ----------
@@ -1198,6 +1198,63 @@ function check(name, pass, detail) {
       `跳后 currentTime=${jumped.toFixed(2)}, clicks=${clicks}, 抑制日志=${suppressed}`);
   }
 
-  const failed = results.filter((r) => !r.pass);  console.log(`\n共 ${results.length} 项，通过 ${results.length - failed.length}，失败 ${failed.length}`);
+  // ---------- BD: 贴尾落点留 TAIL_LEAD（0.6s），不是贴在"结尾前一瞬"（v1.4.9）----------
+  // 现场（v1.4.8 日志）：ct 精确到 dur（26/26、400.3/400.4），但元素从此不再前进、
+  // 永远不发 ended，播放器只能自己 pause，然后靠 ad module 超时换流（每支 5~7 秒）。
+  // 留 0.6 秒媒体，元素才有机会自己走完并发出原生 ended。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 20, currentTime: 0.5, paused: false });
+    const { win } = await loadPage(html, { video });
+    await sleep(2400);                     // 等确认窗口 + tick 落定
+    const t = win.document.querySelector('video').__getTime();
+    check('BD 贴尾留 0.6s 让元素自己走完（不是贴在 dur-0.05）',
+      Math.abs(t - 19.4) < 0.15, `currentTime=${t.toFixed(2)}（期望 19.4）`);
+  }
+
+  // ---------- BE: 收到原生 ended 后不再续播（v1.4.9）----------
+  // 按规范，对 ended 的元素调 play() 会从头重新播放 —— 那时"续播"等于让用户把广告
+  // 再看一遍。正确做法是停手，等 YouTube 换流。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const opts = { duration: 20, currentTime: 0.5, paused: false };
+    const video = makeVideo(new JSDOM('').window, opts);
+    let plays = 0;
+    video.play = () => { plays += 1; return Promise.resolve(); };
+    const { win, logs } = await loadPage(html, { video, debug: true });
+    await sleep(1600);                     // 已贴到 19.4
+    const el = win.document.querySelector('video');
+    el.currentTime = 20;                   // 播到真正的结尾
+    opts.paused = true;                    // ended 之后元素必然是暂停的
+    el.dispatchEvent(new win.Event('ended'));
+    await sleep(2600);                     // 越过 2s 的 🕓 阈值
+    const endedLog = logs.filter((l) => l.indexOf('广告收到原生 ended') >= 0).length;
+    const waitLog = logs.filter((l) => l.indexOf('贴尾等待换流') >= 0).length;
+    const t = el.__getTime();
+    check('BE 收到 ended 后不再 play()（否则等于从头重放广告）',
+      plays === 0 && Math.abs(t - 20) < 0.01 && endedLog === 1 && waitLog === 1,
+      `play()=${plays}, currentTime=${t.toFixed(2)}, ended日志=${endedLog}, 等待日志=${waitLog}`);
+  }
+
+  // ---------- BF: 已经在片尾（ct == dur）时不再开 16×（v1.4.9）----------
+  // 现场（v1.4.8 日志）两次 16× 都在 ct == dur 之后：最后一帧再加速不改变任何时间，
+  // 只会把 playbackRate 改成 16 并把"贴尾暂停 → 续播"挡成「刚催过」。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const opts = { duration: 20, currentTime: 0.5, paused: false };
+    const video = makeVideo(new JSDOM('').window, opts);
+    const { win, logs } = await loadPage(html, { video, debug: true });
+    await sleep(1600);                     // 已贴到 19.4
+    const el = win.document.querySelector('video');
+    el.currentTime = 20;                   // 直接到结尾，此时"没有媒体可走"
+    await sleep(4000);                     // 越过 END_STALL_MS
+    const boosted = logs.filter((l) => l.indexOf('卡在结尾不放') >= 0).length;
+    check('BF 已在片尾时不开 16×（加速改变不了任何时间）',
+      el.playbackRate === 1 && boosted === 0,
+      `playbackRate=${el.playbackRate}, 加速日志=${boosted}`);
+  }
+
+  const failed = results.filter((r) => !r.pass);
+  console.log(`\n共 ${results.length} 项，通过 ${results.length - failed.length}，失败 ${failed.length}`);
   process.exit(failed.length ? 1 : 0);
 })().catch((e) => { console.error('测试异常:', e); process.exit(2); });
