@@ -505,10 +505,12 @@ function check(name, pass, detail) {
     check('T 广告贴尾且暂停时主动续播', plays > 0, `play() ${plays} 次, currentTime=${t.toFixed(2)}`);
   }
 
-  // ---------- U: 推完结尾后 video 停在 readyState=0 -> 催流（现场 7~9 秒切流）----------
+  // ---------- U: 推完结尾后 video 被暂停且停在 readyState=0 -> 催流（现场 7~9 秒切流）----------
   // 2026-11-02 日志：每推完一支广告，<video> 就在 readyState=0 上挂 7~9 秒，
   // 期间 .ad-showing 还在、画面停在最后一帧，seek 一定无效。能做的只有把
   // media element 的资源加载算法重新拉起来 —— 对 readyState=0 的元素调 play()。
+  // v1.4.8：这里必须显式 paused=true —— 只有"被暂停且没有流"才是 play() 能拉起来的情形；
+  // 元素在 paused=false 时已经是 "potentially playing, waiting for data"，浏览器本来就在取流。
   {
     const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
     const opts = { duration: 15, currentTime: 0.5, paused: false };
@@ -520,11 +522,33 @@ function check(name, pass, detail) {
     const jumped = win.document.querySelector('video').__getTime();
     const playsBefore = plays;
     opts.readyState = 0;                     // 播放器把媒体摘了（切流）
+    opts.paused = true;                      // 同时把自己暂停了 —— play() 唯一有用的场景
     await sleep(1600);
     const nudged = logs.filter((l) => l.indexOf('催流') >= 0).length;
-    check('U 推完结尾后 readyState=0 会催流 play()',
+    check('U 推完结尾后暂停且 readyState=0 会催流 play()',
       jumped > 14 && playsBefore === 0 && plays > 0 && plays <= 3 && nudged > 0,
       `跳后 currentTime=${jumped.toFixed(2)}, play() 前=${playsBefore} 后=${plays}, 催流日志=${nudged}`);
+  }
+
+  // ---------- U2: 推完结尾但仍处于"播放中"（paused=false）时不得催流（v1.4.8）----------
+  // 现场（v1.4.7 日志）：三次催流全在 paused=false 下发出一一元素已经在取流，
+  // play() 是空操作，三次之后媒体照样 readyState=0 挂了 8.5 秒。只会刷日志。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const opts = { duration: 15, currentTime: 0.5, paused: false };
+    const video = makeVideo(new JSDOM('').window, opts);
+    let plays = 0;
+    video.play = () => { plays += 1; return Promise.resolve(); };
+    const { win, logs } = await loadPage(html, { video, debug: true });
+    await sleep(1200);
+    const jumped = win.document.querySelector('video').__getTime();
+    const playsBefore = plays;
+    opts.readyState = 0;                     // 摘流，但仍是 paused=false
+    await sleep(1600);
+    const nudged = logs.filter((l) => l.indexOf('催流') >= 0).length;
+    check('U2 推完结尾但仍在取流时不催流 play()',
+      jumped > 14 && playsBefore === 0 && plays === 0 && nudged === 0,
+      `跳后 currentTime=${jumped.toFixed(2)}, play() 次数=${plays}, 催流日志=${nudged}`);
   }
 
   // ---------- V: 没推过的广告在 readyState=0 时不得 play()、不得 seek ----------
@@ -1147,7 +1171,33 @@ function check(name, pass, detail) {
     check('BB 贴尾卡住时 16× 只宣告一次', lines === 1, `宣告行数=${lines}`);
   }
 
-  const failed = results.filter((r) => !r.pass);
-  console.log(`\n共 ${results.length} 项，通过 ${results.length - failed.length}，失败 ${failed.length}`);
+  // ---------- BC: 媒体已被摘掉（贴尾切流中）时不再点跳过按钮（v1.4.8）----------
+  // 现场（v1.4.7 日志）：两支广告各点 2 次，全部发生在 `dur=NaN | readyState=0` 的
+  // 切流窗口里 —— 那个按钮连的是上一支的旧 UI，点了没有任何反应，只会吃 CLICK_BUDGET。
+  // 这里让按钮在**摘流之后**才出现：任何一次点击都只能是新逻辑没生效。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const opts = { duration: 20, currentTime: 0.5, paused: false };
+    const video = makeVideo(new JSDOM('').window, opts);
+    const { win, logs } = await loadPage(html, { video, debug: true });
+    await sleep(1200);                       // 已强跳到 19.95
+    const jumped = win.document.querySelector('video').__getTime();
+    opts.readyState = 0;                     // 播放器摘流
+    opts.duration = NaN;                     // 旧 UI 残留：按钮还在，但已经没有媒体
+    const btn = win.document.createElement('button');
+    btn.className = 'ytp-skip-ad-button';
+    btn.setAttribute('aria-label', '跳过广告');
+    btn.textContent = '跳过广告';
+    let clicks = 0;
+    btn.addEventListener('click', () => { clicks += 1; });
+    win.document.querySelector('#movie_player').appendChild(btn);
+    await sleep(3000);
+    const suppressed = logs.filter((l) => l.indexOf('媒体已被摘（贴尾切流中）') >= 0).length;
+    check('BC 媒体被摘掉后不再点跳过按钮（省下点击预算）',
+      jumped > 19 && clicks === 0 && suppressed >= 1,
+      `跳后 currentTime=${jumped.toFixed(2)}, clicks=${clicks}, 抑制日志=${suppressed}`);
+  }
+
+  const failed = results.filter((r) => !r.pass);  console.log(`\n共 ${results.length} 项，通过 ${results.length - failed.length}，失败 ${failed.length}`);
   process.exit(failed.length ? 1 : 0);
 })().catch((e) => { console.error('测试异常:', e); process.exit(2); });

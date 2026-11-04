@@ -286,6 +286,22 @@
  *  - [改动] `桥=` 状态区分 `空值(getPlayerResponse没返回视频信息)` / `空值(无播放器API)`
  *    / `id不符(adVideoId=27s)` —— 两种空值的修法完全不同
  *  - [改动] 16× 加速只在首次真正加速时打一行，之后静默维持
+ *
+ * v1.4.8：v1.4.7 达标了，但贴尾后的 8 秒里做的事全是空的
+ *  - [事实] 现场日志（v1.4.7，109 行）两个目标都达成：正片播放期 25 次心跳
+ *    全部 `strong= false | 覆盖层= 无`（`#player-ads` 移除生效），
+ *    3 支广告（60 / 29.2 / 25.7+35.4）全部跳掉，`mainDur=1056` 从第一帧就有
+ *  - [事实] 但每支强跳之后都在原地空转 8~10 秒，期间做的事全是无效的：
+ *    `candidate= 1 | 命中点= button.ytp-skip-ad-button` 点了 2 次
+ *    （此时 video 是 readyState=0 / dur=NaN，媒体已被摘掉，按钮连的是上一支的旧 UI）、
+ *    催流 play() 3 次（全部在 `paused= false` 下发出一一元素本就在取流，play() 是空操作）
+ *  - [事实] 4 次点击全落在这个窗口里，第二支广告还没开始 CLICK_BUDGET 就用完了
+ *  - [改动] `tailedWaiting()`：认三件事实（还是我们推的那个元素、时长仍是它、
+ *    没流或仍停在结尾），成立时不再点跳过按钮，每支只留一行 `⏭️ 已贴尾…`
+ *  - [改动] 催流只在 `v.paused` 为真时做（唯一 play() 能拉起来的情形）
+ *  - [改动] 📊 把"媒体未就绪"拆成 `等首支` / `贴尾后等切流`：v1.4.7 那个 86%
+ *    里 15.5 秒是等切流（跟 pod 支数成正比），只有 1.2 秒是真在等第一支挂载。
+ *    混成一个数，这指标就没法用来判断"还值不值得优化"
  */
 (() => {
   'use strict';
@@ -296,7 +312,7 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.4.7'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.4.8'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
@@ -1168,11 +1184,20 @@
   let adFirstActionAt = 0;    // 本次广告内第一次真的动手（跳/加速/催流）的时间
   let adJumpCount = 0;        // 本次广告内成功强跳的次数（pod 会 >1）
   let adMediaWaitMs = 0;      // 本次广告内 video 处于 readyState<1 的累计时长（估算）
-  let adMediaSampleAt = 0;    // 上面那个累计量的采样基准
+  // v1.4.8：上面那个数把两件完全不同的事算在了一起 ——
+  //   ① 广告刚换上、媒体还没挂上（我们只能等）
+  //   ② 我们已经把这一支推到结尾、播放器在换下一支的流（同样只能等，但成因不同）
+  // 混在一起时现场只能看到"媒体未就绪占 86%"，既不像 bug 也不像成本。
+  // 现在单独记 ②，📊 那一行直接拆成"等首支"和"等切流"两个数。
+  let adCutoverWaitMs = 0;    // 其中"已贴尾、在等播放器换流"的那部分
+  let adMediaSampleAt = 0;    // 上面两个累计量的采样基准
   let adMediaReadyDur = 0;    // 已经播报过"媒体就绪"的那支广告的时长（用于去重）
   let nudgeTimes = new WeakMap();       // video -> { n, t } 催流记录（按广告重置）
   const MEDIA_NUDGE_MAX = 3;            // 同一支广告最多催几次
   const MEDIA_NUDGE_GAP = 1200;         // 两次催流的最小间隔
+  // 贴尾后多久内仍认为"这支还是我们推完的那支"。现场切流实测 8~10 秒，
+  // 留 12 秒够用；再久就说明已经进了别的状态，别拿旧结论当真。
+  const TAIL_HOLD_MS = 12000;
 
   // ---- v1.3.8：点击熔断与计数窗口 ----
   // 现场事故（v1.3.7）：广告态持续了 589 秒，期间我们每 4.2 秒点一次那个
@@ -1182,6 +1207,7 @@
   const AD_END_COUNT_WINDOW = 5000;     // 结束前多久内动过手才算"我们跳掉的"（防计数虚高）
   let clickBudget = CLICK_BUDGET;       // 剩余可点击次数（每次广告/换支重置）
   let clickBudgetWarned = false;        // "熔断"那条日志只打一次
+  let tailSkipLogged = 0;               // "已贴尾，不点按钮"那条日志每支只打一次（v1.4.8）
   let adLastActionAt = 0;               // 本次广告内最后一次真的动手的时间
   let durTooLongLogged = 0;             // 已经解释过"时长超过 AD_MAX_DURATION"的那个时长
 
@@ -1504,7 +1530,27 @@
     // 换支了：新的一支重新给足点击预算（pod 里上一支点完 8 次不代表下一支不用点）
     clickBudget = CLICK_BUDGET;
     clickBudgetWarned = false;
+    tailSkipLogged = 0;
     durTooLongLogged = 0;
+  }
+
+  // ---- v1.4.8：识别"我们已经把这一支推到结尾，正在等播放器换流" ----
+  // 现场（v1.4.7 日志）每支广告强跳后都会再点两次跳过按钮、催三次 play()，
+  // 但那一刻 video 是 readyState=0 / duration=NaN —— 媒体已被摘掉，
+  // 按钮连着的是上一支的旧 UI，点了不会发生任何事，还会吃掉 CLICK_BUDGET。
+  // 返回值分三档，因为"有流停在结尾"和"流已经被摘掉"的处理不该一样：
+  //   2 = 流已被摘（readyState=0 / duration 无效）：DOM 里那个按钮是旧 UI，绝不点
+  //   1 = 有流但停在结尾：点它也只是"跳到结尾"，我们已经在那儿了，无收益
+  //   0 = 与我们上一支无关，或早已过了切流窗口
+  // 判据不认"猜"，只认三件事实：还是我们推的那个元素、时长仍是它、当前停在哪。
+  function tailState(v, now) {
+    if (!v || v !== jumpEl || !(jumpDur > 0)) return 0;
+    if (!lastVideoSkip || now - lastVideoSkip > TAIL_HOLD_MS) return 0;
+    if (v.readyState < 1) return 2;
+    const dur = v.duration;
+    const ct = v.currentTime;
+    if (!isFinite(dur) || dur <= 0) return 2;
+    return (isFinite(ct) && ct >= dur - 1.5) ? 1 : 0;
   }
 
   // ---- v1.3.5：广告耗时归因 ----
@@ -1512,6 +1558,7 @@
     adFirstActionAt = 0;
     adJumpCount = 0;
     adMediaWaitMs = 0;
+    adCutoverWaitMs = 0;
     adMediaSampleAt = now;
     adMediaReadyDur = 0;
   }
@@ -1527,7 +1574,14 @@
   function sampleAdMedia(now) {
     const v = currentVideo();
     if (!v) { adMediaSampleAt = now; return; }
-    if (adMediaSampleAt && v.readyState < 1) adMediaWaitMs += now - adMediaSampleAt;
+    if (adMediaSampleAt && v.readyState < 1) {
+      const dt = now - adMediaSampleAt;
+      adMediaWaitMs += dt;
+      // v1.4.8：其中"我们已经贴尾，在等播放器换下一支流"的部分单独记一笔，
+      // 让 📊 那一行能区分"等首支"和"等切流"——两者都是等待，但只有后者
+      // 反复出现才说明 pod 里支数多，跟我们的实现无关。
+      if (tailState(v, now) > 0) adCutoverWaitMs += dt;
+    }
     adMediaSampleAt = now;
     if (v.readyState < 1) return;
     const dur = v.duration;
@@ -1549,6 +1603,11 @@
     // 按"时长等于上次强跳的那支"来判会永远不成立，这个实验就永远不会执行。
     const ours = jumpEl === v;
     if (!ours) return false;
+    // v1.4.8：只有元素真的处于"暂停"才催。现场（v1.4.7 日志）三次催流全都在
+    // paused=false 的情况下发出 —— 元素已经在"potentially playing, waiting for data"，
+    // 浏览器本来就在取流，play() 是空操作；三次之后媒体照样 readyState=0 持续 8.5 秒。
+    // 唯一有意义的情形是"贴尾后播放器把自己暂停了且没有流"，那才是 play() 能拉起来的。
+    if (!v.paused) return false;
     const rec = nudgeTimes.get(v) || { n: 0, t: 0 };
     if (rec.n >= MEDIA_NUDGE_MAX) return false;
     if (now - rec.t < MEDIA_NUDGE_GAP) return false;
@@ -2238,11 +2297,18 @@
         // v1.3.5：一行交代"这次广告的时间去哪了"。现场日志里 18.2 秒只有 1.8 秒
         // 在真的播广告，其余全是 readyState=0 的等待——但那是靠人工数出来的，
         // 现在直接打印，下次判断"该不该继续优化"不用再猜。
+        // v1.4.8：媒体等待拆成两段。现场 v1.4.7 的"占 86%"里，1.2 秒是真在等第一支
+        // 挂载，其余全是强跳后播放器换下一支流的 8~10 秒 —— 后者跟支数成正比，
+        // 不是实现问题。混在一起看，这个指标就没法用来判断"还该不该优化"。
+        const firstWait = Math.max(0, adMediaWaitMs - adCutoverWaitMs);
         dlog('📊 广告结束：总', total, 'ms',
           '| 首次动手', adFirstActionAt ? (adFirstActionAt - adStartedAt) + 'ms' : '（全程未动手）',
           '| 强跳', adJumpCount, '次',
           '| 媒体未就绪累计 ' + adMediaWaitMs + 'ms',
-          adMediaWaitMs ? '（占 ' + Math.round(adMediaWaitMs / total * 100) + '%）' : '');
+          adMediaWaitMs
+            ? '（等首支 ' + firstWait + 'ms / 贴尾后等切流 ' + adCutoverWaitMs + 'ms，占 '
+              + Math.round(adMediaWaitMs / total * 100) + '%）'
+            : '');
         lastVskipWhy = '';
         // v1.3.8：只在"广告真的结束 + 结束前不久我们动过手"时计数。
         // 以前只判"期间动过手"，于是那支 589 秒的广告（点了 140 次全无效、
@@ -2276,7 +2342,16 @@
     // v1.2.3：不再做"点完还在就升级点外层容器"——外层容器就是广告创意，
     // 点它等于帮广告主打开了落地页（用户看到的弹出窗口）。
     const skipBtn = findSkipButton();
-    if (skipBtn) {
+    // v1.4.8：已经把它推到结尾、而且媒体已经被摘掉了，DOM 里那个按钮连的是**上一支**
+    // 的旧 UI，点下去既无效又白吃 CLICK_BUDGET。现场 v1.4.7 日志里 4 次点击全部
+    // 落在这个窗口（dur=NaN / readyState=0），第二支广告还没开始预算就用完了。
+    const tailNow = skipBtn ? tailState(currentVideo(), Date.now()) : 0;
+    if (skipBtn && tailNow === 2) {
+      if (tailSkipLogged !== adScopedSeq) {
+        tailSkipLogged = adScopedSeq;
+        dlog('⏭️ 媒体已被摘（贴尾切流中），跳过按钮不点 | 剩余点击预算=', clickBudget);
+      }
+    } else if (skipBtn) {
       // 跳过按钮是"强广告态下"找到的，延迟期间广告可能已结束/元素被复用，
       // 因此 requireAd=true：点击前要求仍在强广告态（见 scheduleClick 的 S1 复检）。
       const scheduled = scheduleClick(skipBtn, () => { epochActed = true; markAdAction(Date.now()); }, null, true);
