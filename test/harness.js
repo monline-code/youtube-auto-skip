@@ -1417,6 +1417,28 @@ function check(name, pass, detail) {
       `空窗行=${voidLogs.length}, 末行=[${facts.slice(0, 110)}], 汇总=[${summary.slice(0, 130)}]`);
   }
 
+  // ---------- BM: 空窗期 readyState=0 归因为"流已被摘"，空流提示每支只记一次（v1.5.3）----------
+  // 现场（v1.5.2 日志）：空窗期 `dur=NaN`，旧判据 `isFinite(dur)` 恒 false，于是每行
+  // 都写成「广告媒体未加载」—— 方向正好说反，那支是我们推完的、流是播放器摘走的。
+  // 同时 `⏩ 空流跳过催流` 用 3s 节流，一段 7.6 秒空窗刷了 3 行，而 ⏳ 已经逐秒在记了。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const opts = { duration: 30, currentTime: 0.5, paused: false };
+    const video = makeVideo(new JSDOM('').window, opts);
+    video.play = () => Promise.resolve();
+    const { win, logs } = await loadPage(html, { video, debug: true });
+    await sleep(1300);                     // 已强跳到 29.4
+    opts.readyState = 0;
+    opts.duration = NaN;                   // 摘流 —— 现场的 dur=NaN
+    opts.paused = true;                    // 现场空窗期一直是 paused=true
+    await sleep(5200);                     // 空窗 > 5s，旧实现会刷多条
+    const cutover = logs.filter((l) => l.indexOf('流已被摘') >= 0).length;
+    const voidLogs = logs.filter((l) => l.indexOf('空流跳过催流') >= 0).length;
+    check('BM 空窗期 readyState=0 归因为"流已被摘"，空流提示每支只记一次',
+      cutover >= 1 && voidLogs === 1,
+      `切流归因=${cutover}, 空流提示=${voidLogs}`);
+  }
+
   const failed = results.filter((r) => !r.pass);
   console.log(`\n共 ${results.length} 项，通过 ${results.length - failed.length}，失败 ${failed.length}`);
   process.exit(failed.length ? 1 : 0);

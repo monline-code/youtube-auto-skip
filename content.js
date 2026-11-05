@@ -377,6 +377,24 @@
  *    media element 不会因 play() 启动资源加载，这一下只改 paused 标志。
  *    这是**排除干扰变量的受控实验**，不宣称能省掉那 8 秒；有效 duration 的
  *    催流（U 用例）原样保留
+ *
+ * v1.5.3：空窗归因结案（与催流无关），修掉日志说反话的地方
+ *  - [事实] 现场日志（v1.5.2，47 行）1 个 pod / 2 支，`📊 总 21151ms`，
+ *    `流被摘空窗 14529ms（最长一段 7590ms）` —— 两段空窗 7.6s + 6.1s。
+ *    上一版删掉了 `dur=NaN` 时的催流（6 条 `空流跳过催流` 证明它真的生效），
+ *    空窗**一点没变短** → 催流不是干扰变量，这 8 秒是播放器侧的固定等待
+ *  - [事实] 空窗里 `strong=true | readyState=0 | dur=NaN | ct=0 | paused=true`
+ *    全程成立，玩家类多出 `ytp-ad-display-override`；它消失 41ms 后心跳报
+ *    `dur=未知`、再过 613ms 媒体就绪 —— 这 8 秒用户看到的是定格，不是广告画面
+ *  - [事实] `🎯 正片时长参照取自页面桥 … mainDur= 257 s（广告在播时也读得到）`
+ *    —— 页面桥方案第一次在"广告在播"时拿到参照（前几版现场都是读不到）
+ *  - [修正] 空窗期 `readyState=0` 以前被标成「广告媒体未加载」，方向正好说反：
+ *    那支是我们推完的、流是播放器摘走的。改用 `tailState()===2` 判，措辞改成
+ *    「上一支已贴尾，流已被摘，等播放器切流」
+ *  - [降噪] `⏩ 空流跳过催流` 改成每支广告只记一次（以前 3s 一条，一段空窗刷 6 行）
+ *  - [结论] 8 秒空窗扩展侧缩不了：此时没有媒体可 seek / 可 play。唯一能强行推进的
+ *    是页面世界的 `cancelPlayback()`，但它可能连正片一起停 —— 不做。宁可定格 8 秒
+ *    后自己恢复，也不引入一个可能把用户正片停掉的不可逆动作
  */
 (() => {
   'use strict';
@@ -387,7 +405,7 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.5.2'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.5.3'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
@@ -1396,6 +1414,7 @@
   let clickBudgetWarned = false;        // "熔断"那条日志只打一次
   let tailSkipLogged = 0;               // "已贴尾，不点按钮"那条日志每支只打一次（v1.4.8）
   let tailWaitLogged = 0;               // "贴尾等待换流"那条日志每支只打一次（v1.4.9）
+  let voidNudgeLogged = 0;              // "空流跳过催流"那条日志每支只打一次（v1.5.3）
   let adLastActionAt = 0;               // 本次广告内最后一次真的动手的时间
   let durTooLongLogged = 0;             // 已经解释过"时长超过 AD_MAX_DURATION"的那个时长
 
@@ -1720,6 +1739,7 @@
     clickBudgetWarned = false;
     tailSkipLogged = 0;
     tailWaitLogged = 0;
+    voidNudgeLogged = 0;
     endedSeenAt = 0;
     endedLogged = 0;
     tailProbeAt = 0;
@@ -1837,9 +1857,13 @@
     // 撤掉它作为受控实验；U 用例（duration 仍有效）的催流原样保留。
     const dur = v.duration;
     if (!isFinite(dur) || dur <= 0) {
-      dlogReject('voidNudge', '⏩ 空流跳过催流：dur=',
-        isFinite(dur) ? Math.round(dur * 10) / 10 : 'NaN',
-        '| readyState=', v.readyState, '| paused=', v.paused);
+      // v1.5.3：以前用 dlogReject（3s 节流），一段 7.6 秒空窗会刷 3 行。
+      // 空窗本身已经有 ⏳ 逐秒一行了，这条只保留"为什么没催"的一次交代。
+      if (voidNudgeLogged !== adScopedSeq) {
+        voidNudgeLogged = adScopedSeq;
+        dlog('⏩ 空流跳过催流：dur=NaN | readyState=', v.readyState,
+          '| paused=', v.paused, '（没有媒体源，play() 不会启动资源加载）');
+      }
       return false;
     }
     const rec = nudgeTimes.get(v) || { n: 0, t: 0 };
@@ -1921,10 +1945,14 @@
         // 于是把"播放器在切流"误判成"我们没动手"。
         //  - 媒体未加载：广告刚换上/刚被摘流，谁也动不了，只能等
         //  - 已贴尾在切流：我们上一 tick 已经把它推到结尾，播放器正在换下一支
-        const torn = jumpDur > 0 && isFinite(dur) && Math.abs(dur - jumpDur) <= 1;
+        // v1.5.3：现场（v1.5.2 日志）空窗期 `dur=NaN`，旧判据 `isFinite(dur)` 恒为
+        // false，于是每行都写成「广告媒体未加载」—— 方向正好说反：那支是我们推完的，
+        // 流是播放器摘走的。用 tailState()===2 认（它只看"还认不认这个元素"）。
+        const torn = tailState(v, now) === 2
+          || (jumpDur > 0 && isFinite(dur) && Math.abs(dur - jumpDur) <= 1);
         nudgeDetachedMedia(v, now);
         why = why || (torn
-          ? 'readyState=0（上一支已贴尾，播放器在切流）'
+          ? 'readyState=0（上一支已贴尾，流已被摘，等播放器切流）'
           : 'readyState=0（广告媒体未加载）');
         continue;
       }
