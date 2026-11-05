@@ -1439,6 +1439,50 @@ function check(name, pass, detail) {
       `切流归因=${cutover}, 空流提示=${voidLogs}`);
   }
 
+  // ---------- BN: 正片稳定期心跳放慢到 60s（v1.5.4）----------
+  // 现场（v1.5.3 日志，396 行）：350 行都是正片期的空闲心跳，用户每次贴日志要整份复制。
+  // 不真等 60 秒：把页面时钟前移，用"补没补新心跳"断言节奏本身。
+  //   +20s → 旧实现（15s 档）会补一条，新实现（60s 档）一条都不补
+  //   +65s → 新实现补一条，且行里写明 `心跳档= 60s`
+  {
+    const html = `<div id="movie_player" class="html5-video-player"></div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 600, currentTime: 120, paused: false });
+    const { win, logs } = await loadPage(html, { video, debug: true });
+    await sleep(900);                        // 记下 mainDur=600，首条心跳已输出
+    const beatsOf = () => logs.filter((l) => l.indexOf('调试心跳') >= 0);
+    const base = beatsOf().length;
+    const t0 = win.Date.now();
+    win.Date.now = () => t0 + 20000;         // 假时间前移 20s
+    await sleep(900);                        // tick 每 600ms 一轮，足够跑一轮
+    const after20 = beatsOf().length;
+    win.Date.now = () => t0 + 65000;         // 再前移到 65s
+    await sleep(900);
+    const all = beatsOf();
+    const last = all[all.length - 1] || '';
+    check('BN 正片稳定期心跳放慢到 60s（+20s 不补、+65s 才补且标注心跳档）',
+      base >= 1 && after20 === base && all.length > after20 && last.indexOf('心跳档= 60s') >= 0,
+      `首条=${base}, +20s后=${after20}, +65s后=${all.length}, 末条=${last.slice(0, 74)}`);
+  }
+
+  // ---------- BO: 广告期心跳仍然 3s（放慢只作用于正片稳定期）----------
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const video = makeVideo(new JSDOM('').window, { duration: 60, currentTime: 0, paused: false });
+    video.play = () => Promise.resolve();
+    const { win, logs } = await loadPage(html, { video, debug: true });
+    await sleep(700);
+    const beatsOf = () => logs.filter((l) => l.indexOf('调试心跳') >= 0);
+    const before = beatsOf().length;
+    const t0 = win.Date.now();
+    win.Date.now = () => t0 + 4000;
+    await sleep(900);
+    const all = beatsOf();
+    const last = all[all.length - 1] || '';
+    check('BO 广告期心跳仍按 3s 档（降噪不碰广告态）',
+      all.length > before && last.indexOf('心跳档= 3s') >= 0,
+      `前=${before}, 后=${all.length}, 末条=${last.slice(0, 74)}`);
+  }
+
   const failed = results.filter((r) => !r.pass);
   console.log(`\n共 ${results.length} 项，通过 ${results.length - failed.length}，失败 ${failed.length}`);
   process.exit(failed.length ? 1 : 0);

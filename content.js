@@ -395,6 +395,18 @@
  *  - [结论] 8 秒空窗扩展侧缩不了：此时没有媒体可 seek / 可 play。唯一能强行推进的
  *    是页面世界的 `cancelPlayback()`，但它可能连正片一起停 —— 不做。宁可定格 8 秒
  *    后自己恢复，也不引入一个可能把用户正片停掉的不可逆动作
+ *
+ * v1.5.4：日志降噪（零行为变化）—— 正片稳定期心跳 15s → 60s
+ *  - [事实] 现场日志（v1.5.3，396 行）5 个 pod / 10 支全部正常结束，`📊 总`
+ *    5153 / 19169 / 5193 / 15203 / 13202 ms，共 57920ms ≈ 5.8s/支。空窗仍是
+ *    7.0~8.4s 的固定值（占 34858ms = 60%），`⏳` 里 `strong=true | readyState=0 |
+ *    dur=NaN | ct=0 | paused=true | 玩家类含 ytp-ad-display-override` 全程成立
+ *    —— 上一版"播放器侧固定等待"的结论被坐实，无需再改判定逻辑
+ *  - [事实] 396 行里 350 行是正片期的空闲心跳，用户每次贴日志都要整份复制
+ *  - [改动] idleMain（无广告信号 + mainDur 已知 + 媒体就是正片）时心跳间隔
+ *    15s → 60s；广告期 3s、边缘态 15s 一律不变。状态签名一变仍然立即输出，
+ *    所以"刚进广告"不会因为放慢而漏掉
+ *  - [改动] 心跳行末尾补 `心跳档= Xs`：以后看日志不用反推节奏是怎么算的
  */
 (() => {
   'use strict';
@@ -405,7 +417,7 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.5.3'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.5.4'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
@@ -2479,7 +2491,13 @@
     // v1.4.1：长广告也算"会动手"（现在长度不再是拒绝理由），否则 16 分钟里
     // 全是 15s 一行的稀疏心跳，反而看不出它还在盯。
     const canAct = strong && (hitCount > 0 || !mainClipLike(dNow));
-    const interval = Math.max(minGap || 0, canAct ? 3000 : 15000);
+    // v1.5.4：正片稳定期（没有任何广告信号 + 参照已知 + 当前媒体就是正片）心跳
+    // 15s → 60s。这一档唯一的作用是"证明还在盯"，可 v1.5.3 现场 396 行里有 350 行
+    // 都是它，用户每次贴日志都得整份复制。广告期 3s、边缘态 15s 一律不动；
+    // 状态签名一变仍然立即输出，所以放慢不会漏掉"刚进广告"那一下。
+    const idleMain = !strong && !adPlaying && !adShowing
+      && mainDur > 0 && mainClipLike(dNow);
+    const interval = Math.max(minGap || 0, canAct ? 3000 : (idleMain ? 60000 : 15000));
     if (sig !== lastBeatSig || now - lastDebugBeat > interval) {
       lastBeatSig = sig;
       lastDebugBeat = now;
@@ -2492,7 +2510,8 @@
         '| dur=', isFinite(dNow) ? Math.round(dNow * 10) / 10 : '未知',
         '| ct=', isFinite(ctNow) ? ctNow : '未知',
         '| mainDur=', mainDur > 0 ? Math.round(mainDur * 10) / 10 : '未知',
-        '| 选择器命中数=', hitCount);
+        '| 选择器命中数=', hitCount,
+        '| 心跳档=', (interval / 1000) + 's');
     }
   }
 
