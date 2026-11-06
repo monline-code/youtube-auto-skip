@@ -407,6 +407,18 @@
  *    15s → 60s；广告期 3s、边缘态 15s 一律不变。状态签名一变仍然立即输出，
  *    所以"刚进广告"不会因为放慢而漏掉
  *  - [改动] 心跳行末尾补 `心跳档= Xs`：以后看日志不用反推节奏是怎么算的
+ *
+ * v1.5.5：补上 v1.5.4 漏掉的另一档空闲 —— 加载期
+ *  - [事实] 现场日志（v1.5.4，9 行）：前 76 秒 6 条心跳全是 `dur= 未知 | ct= 未知 |
+ *    mainDur= 未知`，`心跳档= 15s`。这段是页面刚打开、播放器还没挂上媒体，
+ *    `idleMain` 要求 `mainDur > 0`（v1.5.4 的判据），所以一次都没命中
+ *  - [改动] 新增 idleLoad：无广告信号 + 连媒体时长都没有（`dur` 非有限数）+
+ *    参照也没有 → 60s。这一档和 idleMain 的区别是"正片还没开始"，同样是纯证明
+ *    "还在盯"，不需要 15s 一行
+ *  - [不做] 有媒体但参照未知（边播边等 mainDur）仍是 15s —— 那条真的需要盯，
+ *    `recordMainDur()` 就在等这一下
+ *  - [安全] 广告开始由 `📺 检测到广告开始`（事件行）+ 签名变化（strong/adPlaying/
+ *    .ad-showing/命中数）负责，不依赖心跳；放慢不可能漏掉"刚进广告"
  */
 (() => {
   'use strict';
@@ -417,7 +429,7 @@
   // 版本号：每次加载无条件打印一行，方便确认"页面里跑的到底是哪一版"
   // （排查时最常见的问题就是改了代码但没刷新扩展/页面）
   const VERSION = (() => {
-    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.5.4'; }
+    try { return chrome.runtime.getManifest().version; } catch (_) { return '1.5.5'; }
   })();
   try { console.log('[YT-AutoSkip] v' + VERSION + ' 已加载'); } catch (_) { /* ignore */ }
 
@@ -2497,7 +2509,16 @@
     // 状态签名一变仍然立即输出，所以放慢不会漏掉"刚进广告"那一下。
     const idleMain = !strong && !adPlaying && !adShowing
       && mainDur > 0 && mainClipLike(dNow);
-    const interval = Math.max(minGap || 0, canAct ? 3000 : (idleMain ? 60000 : 15000));
+    // v1.5.5：加载期也算空闲。v1.5.4 现场日志（9 行）里前 76 秒 6 条心跳全是
+    // `dur= 未知 | mainDur= 未知 | 心跳档= 15s`——页面刚打开、播放器还没挂上媒体，
+    // idleMain 要求 mainDur > 0，一次都没命中。这段没有任何可动手对象，
+    // 缩短只为了证明"还在盯"，和 idleMain 一样降到 60s。
+    // 注意只覆盖"连 dur 都没有"：有媒体但参照未知（边播边等 mainDur）仍留 15s，
+    // 那条真的需要盯——recordMainDur() 正要靠这一下把参照记下来。
+    const idleLoad = !strong && !adPlaying && !adShowing
+      && !(mainDur > 0) && !isFinite(dNow);
+    const interval = Math.max(minGap || 0,
+      canAct ? 3000 : (idleMain || idleLoad) ? 60000 : 15000);
     if (sig !== lastBeatSig || now - lastDebugBeat > interval) {
       lastBeatSig = sig;
       lastDebugBeat = now;

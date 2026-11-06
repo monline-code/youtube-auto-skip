@@ -1405,7 +1405,11 @@ function check(name, pass, detail) {
     await sleep(1200);                       // 已贴尾
     opts.readyState = 0;
     opts.duration = NaN;                     // 摘流，进入空窗
-    await sleep(3600);                       // 空窗 > 2s，逐秒诊断该出现
+    await sleep(5200);                       // 空窗 > 2s，逐秒诊断该出现
+                                             // （v1.5.5：原 3600 太紧。空窗要等
+                                             //  tailState 变 2 才开始计时，阈值 2s +
+                                             //  每秒一行 = 最早 2.0s / 3.0s 两行，
+                                             //  抖动一下只剩 1 行 → BL 偶发假失败）
     const voidLogs = logs.filter((l) => l.indexOf('⏳ 贴尾空窗') >= 0);
     const facts = voidLogs.length ? voidLogs[voidLogs.length - 1] : '';
     win.document.querySelector('#movie_player').classList.remove('ad-showing');
@@ -1481,6 +1485,31 @@ function check(name, pass, detail) {
     check('BO 广告期心跳仍按 3s 档（降噪不碰广告态）',
       all.length > before && last.indexOf('心跳档= 3s') >= 0,
       `前=${before}, 后=${all.length}, 末条=${last.slice(0, 74)}`);
+  }
+
+  // ---------- BP: 加载期（无媒体、无参照）心跳也降到 60s（v1.5.5）----------
+  // 现场（v1.5.4 日志，9 行）：前 76 秒 6 条心跳全是 `dur= 未知 | mainDur= 未知 |
+  // 心跳档= 15s`。idleMain 要求 mainDur>0，所以这一段一次都没命中。
+  {
+    const html = `<div id="movie_player" class="html5-video-player"></div>`;
+    const { win, logs } = await loadPage(html, { debug: true });
+    await sleep(900);
+    const beatsOf = () => logs.filter((l) => l.indexOf('调试心跳') >= 0);
+    const base = beatsOf().length;
+    const first = beatsOf()[0] || '';
+    const t0 = win.Date.now();
+    win.Date.now = () => t0 + 20000;
+    await sleep(900);
+    const after20 = beatsOf().length;
+    win.Date.now = () => t0 + 65000;
+    await sleep(900);
+    const all = beatsOf();
+    const last = all[all.length - 1] || '';
+    check('BP 加载期心跳也按 60s 档（+20s 不补、+65s 才补）',
+      base >= 1 && first.indexOf('心跳档= 60s') >= 0
+        && after20 === base && all.length > after20
+        && last.indexOf('心跳档= 60s') >= 0,
+      `首条=${base}（${first.slice(0, 40)}）, +20s后=${after20}, +65s后=${all.length}`);
   }
 
   const failed = results.filter((r) => !r.pass);
