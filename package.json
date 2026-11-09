@@ -1,6 +1,6 @@
 {
   "name": "youtube-auto-skip",
-  "version": "1.5.6",
+  "version": "1.5.7",
   "private": true,
   "description": "Chrome 扩展：YouTube 广告自动跳过",
   "scripts": {

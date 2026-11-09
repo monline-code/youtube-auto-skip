@@ -1,14 +1,21 @@
 const toggle = document.getElementById('toggle');
 const debugToggle = document.getElementById('debug');
+const prerollInput = document.getElementById('preroll');
 const skippedEl = document.getElementById('skipped');
 const resetBtn = document.getElementById('reset');
 const dumpBtn = document.getElementById('dump');
 const dumpHint = document.getElementById('dumpHint');
 
+// 首个前置广告的真实播放门槛（毫秒）：默认 1500，0 = 关闭
+const PREROLL_DEFAULT_MS = 1500;
+const PREROLL_MIN_MS = 0;
+const PREROLL_MAX_MS = 15000;
+
 // 初始化
-chrome.storage.sync.get({ enabled: true, debug: false }, (data) => {
+chrome.storage.sync.get({ enabled: true, debug: false, prerollMs: PREROLL_DEFAULT_MS }, (data) => {
   toggle.checked = data.enabled;
   debugToggle.checked = data.debug;
+  prerollInput.value = String(Math.round(Number(data.prerollMs) / 100) / 10);
 });
 
 chrome.storage.local.get({ skipped: 0 }, (data) => {
@@ -23,6 +30,20 @@ toggle.addEventListener('change', () => {
 // 调试日志开关
 debugToggle.addEventListener('change', () => {
   chrome.storage.sync.set({ debug: debugToggle.checked });
+});
+
+// 首支广告门槛：输入秒数，存毫秒。非法输入按默认值处理，不做静默丢弃。
+function savePreroll() {
+  const sec = parseFloat(prerollInput.value);
+  const ms = isFinite(sec)
+    ? Math.min(PREROLL_MAX_MS, Math.max(PREROLL_MIN_MS, Math.round(sec * 1000)))
+    : PREROLL_DEFAULT_MS;
+  prerollInput.value = String(Math.round(ms / 100) / 10);
+  chrome.storage.sync.set({ prerollMs: ms });
+}
+prerollInput.addEventListener('change', savePreroll);
+prerollInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') prerollInput.blur();   // 回车即生效
 });
 
 // 清零
@@ -80,5 +101,8 @@ dumpBtn.addEventListener('click', () => {
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && changes.skipped) {
     skippedEl.textContent = changes.newValue;
+  }
+  if (area === 'sync' && changes.prerollMs && document.activeElement !== prerollInput) {
+    prerollInput.value = String(Math.round(Number(changes.newValue.newValue) / 100) / 10);
   }
 });

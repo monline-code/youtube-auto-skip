@@ -429,10 +429,12 @@
  *    判不了"请求被拦"那一类；但 `ct` 从 0 直跳 29.5 是页面世界完全可见的
  *    "播放序列不符合预期"，属于行为式反拦截检测的典型信号
  *  - [改动] 新增 `prerollGate`：本视频的**第一支**广告必须真实播放满
- *    `PREROLL_REAL_PLAY_MS=1500ms`（按 `ct` 前进量算，等待不算）才放行；
+ *    `prerollMs`（按 `ct` 前进量算，等待不算）才放行；
  *    跳过后 / 广告结束后 / 换支后 / 换视频后门槛解除，pod 里后续广告照旧秒跳
+ *  - [配置 v1.5.7] 门槛时长改成弹窗可设的 `prerollMs`（chrome.storage.sync，
+ *    默认 1500，范围 0~15000，0 = 关闭门槛回到 v1.5.5 行为），改完立刻生效
  *  - [兜底] 2 秒内 `ct` 一点没走 → 广告根本没在播，不等了直接放行；
- *    总等待 6 秒上限（极慢速播放也不会被门槛拖住）
+ *    总等待上限 = 门槛 + 3s，最低 6s（极慢速播放也不会被门槛拖住）
  *  - [不保证] 这是行为痕迹的收敛，不是保证。YouTube 判据不公开，只能压"一帧
  *    没播就完成"这种最刺眼的形态
  */
@@ -671,12 +673,18 @@
     });
   }
 
-  function loadDebug() {
+  // v1.5.7：一次读回全部设置。debug 必须先于 start() 生效（见文末注释），
+  // 前置门槛时长同理 —— 否则第一支广告会用默认值跑完再被改掉。
+  function loadSettings() {
     safeStorage(() => {
-      chrome.storage.sync.get({ debug: false }, (data) => {
+      chrome.storage.sync.get({ debug: false, prerollMs: PREROLL_MS_DEFAULT }, (data) => {
         if (chrome.runtime.lastError) return;
         debug = !!data.debug;
+        prerollRealPlayMs = normPrerollMs(data.prerollMs);
         dlog('调试已开启，开始记录广告检测过程');
+        dlog('⚙️ 前置广告门槛=', prerollEnabled()
+          ? (Math.round(prerollRealPlayMs / 100) / 10 + 's')
+          : '关闭（0ms，媒体就绪即强跳）');
       });
     });
   }
@@ -1318,10 +1326,25 @@
   // 对不上），属于 YouTube 反拦截检测里"播放序列不符合预期"这一类信号。
   // 所以首个广告改成：**真实播放满 1.5 秒**才允许强跳。后续广告不受约束 ——
   // 问题从来不在"跳广告"，而在"广告根本没开始就被完成"。
-  const PREROLL_REAL_PLAY_MS = 1500;   // 首个前置广告至少要真的播这么久
+  // v1.5.7：门槛时长改成可配置项（弹窗里调，存 chrome.storage.sync）。
+  // 0 = 关闭门槛，行为退回 v1.5.5（媒体就绪立刻强跳）。
+  const PREROLL_MS_DEFAULT = 1500;
+  const PREROLL_MS_MIN = 0;
+  const PREROLL_MS_MAX = 15000;
+  let prerollRealPlayMs = PREROLL_MS_DEFAULT;   // 首个前置广告至少要真的播这么久
   const PREROLL_STALL_MS = 2000;       // 2 秒内 ct 一点没走 = 广告根本没在播，别死等
   const PREROLL_STALL_EPS = 0.2;       // 低于这个进度算"没走"
-  const PREROLL_MAX_WAIT_MS = 6000;    // 上限：极慢速播放也在 6 秒内放行
+  // 上限跟着门槛走：门槛 1.5s → 6s；门槛 10s → 13s。否则门槛比上限还长时永远是"上限放行"
+  function prerollMaxWaitMs() {
+    return Math.min(PREROLL_MS_MAX + 5000, Math.max(6000, prerollRealPlayMs + 3000));
+  }
+  // 门槛关掉时整段逻辑直接短路，不留任何额外等待
+  function prerollEnabled() { return prerollRealPlayMs > 0; }
+  function normPrerollMs(v) {
+    const n = Number(v);
+    if (!isFinite(n)) return PREROLL_MS_DEFAULT;
+    return Math.min(PREROLL_MS_MAX, Math.max(PREROLL_MS_MIN, Math.round(n)));
+  }
   // active=true 表示"还没见过本视频的第一个广告"。跳过/结束/换支后置 false。
   // 不用 adEpoch 判：那是全局计数，不随导航归零。
   const prerollGate = { active: true, baseCt: -1, baseDur: 0, baseAt: 0, waitMs: 0 };
@@ -1819,12 +1842,13 @@
   // 文案里不带毫秒数：logVskipWhy 是"原因变了才打"，数字一变就每 tick 刷一行。
   function prerollHold(ct, dur, now) {
     if (!prerollGate.active) return '';
+    if (!prerollEnabled()) { prerollGate.active = false; return ''; }   // 参数设成 0 = 关闭
     if (prerollGate.baseCt < 0 || prerollGate.baseDur <= 0) {
       // 本视频第一支广告的媒体刚可用：从现在起算"已经播了多久"
       prerollGate.baseCt = ct;
       prerollGate.baseDur = dur;
       prerollGate.baseAt = now;
-      return '前置广告刚开始真实播放（门槛 1500ms）';
+      return '前置广告刚开始真实播放（门槛 ' + prerollRealPlayMs + 'ms）';
     }
     // 换支了（pod 第二支 / 用户自己点了跳过 / 同一个元素被复用）：第一支已经过去
     if (Math.abs(dur - prerollGate.baseDur) > 1 || ct < prerollGate.baseCt - 1) {
@@ -1832,13 +1856,13 @@
       return '';
     }
     const played = ct - prerollGate.baseCt;   // 真实前进的秒数（ct 不会因为等待而增加）
-    if (played * 1000 >= PREROLL_REAL_PLAY_MS) return '';
-    if (prerollGate.baseCt * 1000 >= PREROLL_REAL_PLAY_MS) return '';  // 我们来晚了，广告已播够
+    if (played * 1000 >= prerollRealPlayMs) return '';
+    if (prerollGate.baseCt * 1000 >= prerollRealPlayMs) return '';  // 我们来晚了，广告已播够
     const waited = now - prerollGate.baseAt;
-    if (waited >= PREROLL_MAX_WAIT_MS) return '';                      // 上限兜底
+    if (waited >= prerollMaxWaitMs()) return '';                      // 上限兜底
     // 广告压根没在播（卡在某一帧 / 解码不动）：等下去也换不来"真实播放"，别再拖
     if (waited >= PREROLL_STALL_MS && played < PREROLL_STALL_EPS) return '';
-    return '前置广告真实播放未满 1500ms（放行门槛）';
+    return '前置广告真实播放未满 ' + prerollRealPlayMs + 'ms（放行门槛）';
   }
 
   // 门槛放行、即将动手时调用：关掉门槛并留一行，现场能直接看出"这 1.5 秒花在哪"
@@ -1846,7 +1870,8 @@
     if (!prerollGate.active) return;
     prerollGate.active = false;
     prerollGate.waitMs = prerollGate.baseAt ? now - prerollGate.baseAt : 0;
-    dlog('🕒 前置广告门槛放行：真实播放 ct=', Math.round(ct * 10) / 10, 's（门槛 1.5s）',
+    dlog('🕒 前置广告门槛放行：真实播放 ct=', Math.round(ct * 10) / 10, 's（门槛',
+      Math.round(prerollRealPlayMs / 100) / 10, 's）',
       '| 等待=', prerollGate.waitMs, 'ms');
   }
 
@@ -2227,7 +2252,8 @@
         continue;
       }
 
-      // v1.5.6：首个前置广告必须先真实播满 1.5 秒才允许动手（理由见 PREROLL_REAL_PLAY_MS）。
+      // v1.5.6：首个前置广告必须先真实播满 prerollMs 才允许动手（理由见文件头）。
+      // v1.5.7：时长来自设置，0 = 关闭（prerollHold 内部短路）。
       // 只约束本视频的第一支：跳过 / 结束 / 换支之后 active=false，pod 里后续广告照旧秒跳。
       const hold = prerollHold(ct, dur, now);
       if (hold) { why = why || hold; continue; }
@@ -2700,7 +2726,11 @@
         askBridge();
         if (!(mainDur > 0)) adoptMainDurFromPage('进广告时');
         dlog('📺 检测到广告开始（第', adEpoch, '次）',
-          prerollGate.active ? '| 前置广告门槛= 1.5s（真实播放后才放行）' : '');
+          prerollGate.active
+            ? '| 前置广告门槛= ' + (prerollEnabled()
+              ? (Math.round(prerollRealPlayMs / 100) / 10 + 's（真实播放后才放行）')
+              : '关闭')
+            : '');
       } else {
         // v1.4.0 残留看门狗：窗口开着，可媒体一直是正片 —— forceSkip 反正也不会动
         // （mainClipLike / 无参照 两条会拒），多半是 .ad-showing / 覆盖层的残留。
@@ -2907,17 +2937,30 @@
       debug = !!changes.debug.newValue;
       dlog('调试开关切换为', debug);
     }
+    // v1.5.7：弹窗里改门槛时长 -> 立刻生效，不需要刷新页面。
+    // 已经放行过的首支广告不会因为调大而回退（prerollGate.active 已 false），符合预期。
+    if (area === 'sync' && changes.prerollMs) {
+      const before = prerollRealPlayMs;
+      prerollRealPlayMs = normPrerollMs(changes.prerollMs.newValue);
+      if (before !== prerollRealPlayMs) {
+        dlog('⚙️ 前置广告门槛已更新：', prerollEnabled()
+          ? (Math.round(prerollRealPlayMs / 100) / 10 + 's')
+          : '关闭（媒体就绪即强跳）');
+        scheduleTick();
+      }
+    }
   };
 
   // v1.4.5：**先读调试开关，再启动主循环**。
   // 现场（v1.4.4 日志第一段）的第一支广告往往在页面刚加载时就开始，而
   // applyState() 里会立刻 tick() 一次 —— 那一 tick 早于 debug 开关读回来，
   // 于是"广告开始 / 🎯 参照来源"这些最关键的几行被全部丢掉（打开链接先播广告
-  // 的现场，本来就指望这几行）。两个 storage 回调都是异步的，按注册顺序先读 debug 即可。
+  // 的现场，本来就指望这几行）。两个 storage 回调都是异步的，按注册顺序先读设置即可。
+  // v1.5.6：同一个回调里把 `prerollMs` 也读回来，避免第一支广告用默认值跑完才被改。
   // v1.4.6：桥也要尽早起 —— 它第一次上报就可能把 mainDur 填上，而这一步理应
   // 发生在任何广告开始之前。
   installBridge();
-  loadDebug();
+  loadSettings();
 
   safeStorage(() => {
     chrome.storage.sync.get({ enabled: true }, (data) => {

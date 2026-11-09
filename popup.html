@@ -41,6 +41,13 @@
     input:checked + .slider { background: #d32f2f; }
     input:checked + .slider::before { transform: translateX(18px); }
     .hint { font-size: 11px; color: #999; margin-top: 10px; line-height: 1.5; }
+    .num { font-size: 12px; color: #555; display: flex; align-items: center; gap: 4px; }
+    .num input {
+      width: 54px; padding: 3px 4px; font-size: 12px; text-align: right;
+      border: 1px solid #d5d5d5; border-radius: 4px; color: #1f1f1f;
+    }
+    .num input:focus { outline: none; border-color: #d32f2f; }
+    .subHint { font-size: 10px; color: #aaa; margin: -8px 0 10px; line-height: 1.4; }
     .reset {
       font-size: 11px; color: #1a73e8; background: none; border: none;
       cursor: pointer; padding: 0; margin-top: 8px;
@@ -71,6 +78,11 @@
       <span class="slider"></span>
     </label>
   </div>
+  <div class="row">
+    <span class="label">首支广告播满</span>
+    <span class="num"><input type="number" id="preroll" min="0" max="15" step="0.5" aria-label="首个前置广告需真实播放的秒数" /> 秒</span>
+  </div>
+  <div class="subHint">0 = 关闭（媒体就绪立即跳过）</div>
   <div class="count">已累计自动跳过：<b id="skipped">0</b> 次</div>
   <button class="reset" id="reset">清零计数</button>
   <button class="dump" id="dump">复制调试日志</button>

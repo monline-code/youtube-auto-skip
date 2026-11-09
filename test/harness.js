@@ -124,7 +124,7 @@ function bridgePush(win, urlId, cands, playing) {
   } catch (_) { /* ignore */ }
 }
 
-async function loadPage(html, { video, enabled = true, debug = false, stub, zeroRect, url } = {}) {
+async function loadPage(html, { video, enabled = true, debug = false, sync, stub, zeroRect, url } = {}) {
   // v1.4.4：默认给一个 watch 页 URL —— 正片时长参照要靠 URL 里的 video id 判断归属
   const dom = new JSDOM(`<!DOCTYPE html><body>${html}</body>`, {
     runScripts: 'outside-only',
@@ -142,7 +142,7 @@ async function loadPage(html, { video, enabled = true, debug = false, stub, zero
   };
   const player = win.document.querySelector('#movie_player');
   if (video && player) player.appendChild(video);
-  win.chrome = makeChrome({ enabled, debug });
+  win.chrome = makeChrome(Object.assign({ enabled, debug }, sync || {}));
   // debug 模式下截获扩展日志，供测试断言（如"是否为某按钮调度了点击"）
   const logs = [];
   if (debug) {
@@ -488,6 +488,62 @@ function check(name, pass, detail) {
     await sleep(1000);
     const t = win.document.querySelector('video').__getTime();
     check('Q2 第二支广告不受前置门槛约束（仍秒跳）', t > 21.3, `第二支 currentTime=${t.toFixed(2)}`);
+  }
+
+  // ---------- BQ: 门槛设成 0 = 关闭，行为回到 v1.5.5（媒体就绪即强跳）----------
+  // v1.5.7：门槛时长变成可配置项，0 必须是"完全不等"，而不是"等 0ms 但还留兜底逻辑"。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const video = makeVideo(new JSDOM('').window,
+      { duration: 15, currentTime: 0.5, paused: false });   // 故意不 advance：ct 不走也照样秒跳
+    const { win, logs } = await loadPage(html, { video, debug: true, sync: { prerollMs: 0 } });
+    await sleep(1500);
+    const t = win.document.querySelector('video').__getTime();
+    const said = logs.some((l) => l.indexOf('⚙️ 前置广告门槛= 关闭') >= 0);
+    const marked = logs.some((l) => l.indexOf('前置广告门槛= 关闭') >= 0 && l.indexOf('📺') >= 0);
+    check('BQ prerollMs=0 时门槛关闭，首个广告立即强跳',
+      t > 14 && said && marked,
+      `currentTime=${t.toFixed(2)}, 启动日志=${said}, 广告行=${marked}`);
+  }
+
+  // ---------- BR: 门槛时长可调大（4s），放行时间随之推后 ----------
+  // 反向验证：若参数没接进去（仍写死 1.5s），2.1 秒时早就跳了，本用例必失败。
+  {
+    const html = `<div id="movie_player" class="html5-video-player"></div>`;
+    const opts = { duration: 600, currentTime: 120, paused: false, advance: true };
+    const video = makeVideo(new JSDOM('').window, opts);
+    const { win, player, logs } = await loadPage(html,
+      { video, debug: true, sync: { prerollMs: 4000 } });
+    await sleep(700);                        // 先记下 mainDur=600
+    opts.duration = 15;
+    video.currentTime = 0.5;
+    player.classList.add('ad-showing');
+    await sleep(2100);
+    const early = win.document.querySelector('video').__getTime();
+    await sleep(3000);
+    const late = win.document.querySelector('video').__getTime();
+    const shown = logs.some((l) => l.indexOf('门槛= 4s') >= 0 || l.indexOf('（门槛 4s）') >= 0);
+    check('BR prerollMs=4000 时门槛真的按 4s 放行',
+      shown && early < 14 && late > 14,
+      `2.1s 时=${early.toFixed(2)}, 5.1s 时=${late.toFixed(2)}, 日志含门槛4s=${shown}`);
+  }
+
+  // ---------- BS: 运行中改设置立即生效（不必刷新页面）----------
+  // v1.5.7 的关键体验：用户觉得 1.5 秒太长，弹窗改成 0 就该立刻不再等。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const opts = { duration: 15, currentTime: 0.5, paused: false, advance: true };
+    const video = makeVideo(new JSDOM('').window, opts);
+    const { win, chrome: ch, logs } = await loadPage(html, { video, debug: true });
+    await sleep(800);                        // 默认 1.5s：此时还没跳
+    const before = win.document.querySelector('video').__getTime();
+    ch.storage.sync.set({ prerollMs: 0 });
+    await sleep(1600);
+    const after = win.document.querySelector('video').__getTime();
+    const said = logs.some((l) => l.indexOf('⚙️ 前置广告门槛已更新') >= 0);
+    check('BS 运行中把门槛改成 0，下一 tick 立即放行',
+      before < 14 && after > 14 && said,
+      `改前=${before.toFixed(2)}, 改后=${after.toFixed(2)}, 日志=${said}`);
   }
 
   // ---------- R: 广告起播 0.5s 内不强跳（安全边界）----------
