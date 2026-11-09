@@ -419,6 +419,22 @@
  *    `recordMainDur()` 就在等这一下
  *  - [安全] 广告开始由 `📺 检测到广告开始`（事件行）+ 签名变化（strong/adPlaying/
  *    .ad-showing/命中数）负责，不依赖心跳；放慢不可能漏掉"刚进广告"
+ *
+ * v1.5.6：首个前置广告必须先"真实播放"1.5 秒才允许强跳
+ *  - [事实] 用户报 YouTube 弹「使用广告拦截器违反服务条款」+「您安装了下列哪个
+ *    扩展程序？」。同批日志（v1.5.5，14 行）显示：+1740ms 广告媒体就绪
+ *    （duration= 30.1），+1741ms 就 `currentTime= 29.5` —— 拿到 metadata 的
+ *    **同一个 tick** 就贴尾，这支 30 秒广告一帧都没播过
+ *  - [判定] 本扩展不拦网络、不注入 CSS、不隐藏页面（manifest 只有 storage），
+ *    判不了"请求被拦"那一类；但 `ct` 从 0 直跳 29.5 是页面世界完全可见的
+ *    "播放序列不符合预期"，属于行为式反拦截检测的典型信号
+ *  - [改动] 新增 `prerollGate`：本视频的**第一支**广告必须真实播放满
+ *    `PREROLL_REAL_PLAY_MS=1500ms`（按 `ct` 前进量算，等待不算）才放行；
+ *    跳过后 / 广告结束后 / 换支后 / 换视频后门槛解除，pod 里后续广告照旧秒跳
+ *  - [兜底] 2 秒内 `ct` 一点没走 → 广告根本没在播，不等了直接放行；
+ *    总等待 6 秒上限（极慢速播放也不会被门槛拖住）
+ *  - [不保证] 这是行为痕迹的收敛，不是保证。YouTube 判据不公开，只能压"一帧
+ *    没播就完成"这种最刺眼的形态
  */
 (() => {
   'use strict';
@@ -1292,6 +1308,31 @@
   // v1.5.1：不再补发 ended，改成"停滞就重新落点 + 续播"的自救，并加硬兜底。
   const TAIL_HEAL_GAP_MS = 2500;   // 两次自救的最小间隔
   const TAIL_HEAL_HARD_MS = 8000;  // 贴尾这么久还没换流 → 无视一切标志强制破局
+
+  // ---------------- v1.5.6：首个前置广告的"真实播放"门槛 ----------------
+  // 现场（v1.5.5，用户报 YouTube 弹「使用广告拦截器违反服务条款」）：
+  //   +1740ms 🎬 广告媒体就绪：duration= 30.1
+  //   +1741ms ⏩ 视频层强跳：duration= 30.1 → currentTime= 29.5
+  // 拿到 metadata 的**同一个 tick** 就 seek 到结尾，这支 30 秒广告一帧都没播过。
+  // ct 从 0 直接到 29.5 是页面世界完全可见的行为异常（seeking/seeked + 时长与进度
+  // 对不上），属于 YouTube 反拦截检测里"播放序列不符合预期"这一类信号。
+  // 所以首个广告改成：**真实播放满 1.5 秒**才允许强跳。后续广告不受约束 ——
+  // 问题从来不在"跳广告"，而在"广告根本没开始就被完成"。
+  const PREROLL_REAL_PLAY_MS = 1500;   // 首个前置广告至少要真的播这么久
+  const PREROLL_STALL_MS = 2000;       // 2 秒内 ct 一点没走 = 广告根本没在播，别死等
+  const PREROLL_STALL_EPS = 0.2;       // 低于这个进度算"没走"
+  const PREROLL_MAX_WAIT_MS = 6000;    // 上限：极慢速播放也在 6 秒内放行
+  // active=true 表示"还没见过本视频的第一个广告"。跳过/结束/换支后置 false。
+  // 不用 adEpoch 判：那是全局计数，不随导航归零。
+  const prerollGate = { active: true, baseCt: -1, baseDur: 0, baseAt: 0, waitMs: 0 };
+  function resetPrerollGate() {
+    prerollGate.active = true;
+    prerollGate.baseCt = -1;
+    prerollGate.baseDur = 0;
+    prerollGate.baseAt = 0;
+    prerollGate.waitMs = 0;
+  }
+
   let lastVideoSkip = 0;
   let mainDur = 0;               // 最近一次"非广告态"观察到的正片时长
   let adEndGuardUntil = 0;       // 广告刚结束的一小段时间内禁止动进度
@@ -1773,6 +1814,42 @@
     durTooLongLogged = 0;
   }
 
+  // ---- v1.5.6：首个前置广告的放行门槛 ----
+  // 返回 '' 表示可以强跳；否则返回"还不能跳"的原因。
+  // 文案里不带毫秒数：logVskipWhy 是"原因变了才打"，数字一变就每 tick 刷一行。
+  function prerollHold(ct, dur, now) {
+    if (!prerollGate.active) return '';
+    if (prerollGate.baseCt < 0 || prerollGate.baseDur <= 0) {
+      // 本视频第一支广告的媒体刚可用：从现在起算"已经播了多久"
+      prerollGate.baseCt = ct;
+      prerollGate.baseDur = dur;
+      prerollGate.baseAt = now;
+      return '前置广告刚开始真实播放（门槛 1500ms）';
+    }
+    // 换支了（pod 第二支 / 用户自己点了跳过 / 同一个元素被复用）：第一支已经过去
+    if (Math.abs(dur - prerollGate.baseDur) > 1 || ct < prerollGate.baseCt - 1) {
+      prerollGate.active = false;
+      return '';
+    }
+    const played = ct - prerollGate.baseCt;   // 真实前进的秒数（ct 不会因为等待而增加）
+    if (played * 1000 >= PREROLL_REAL_PLAY_MS) return '';
+    if (prerollGate.baseCt * 1000 >= PREROLL_REAL_PLAY_MS) return '';  // 我们来晚了，广告已播够
+    const waited = now - prerollGate.baseAt;
+    if (waited >= PREROLL_MAX_WAIT_MS) return '';                      // 上限兜底
+    // 广告压根没在播（卡在某一帧 / 解码不动）：等下去也换不来"真实播放"，别再拖
+    if (waited >= PREROLL_STALL_MS && played < PREROLL_STALL_EPS) return '';
+    return '前置广告真实播放未满 1500ms（放行门槛）';
+  }
+
+  // 门槛放行、即将动手时调用：关掉门槛并留一行，现场能直接看出"这 1.5 秒花在哪"
+  function prerollRelease(ct, now) {
+    if (!prerollGate.active) return;
+    prerollGate.active = false;
+    prerollGate.waitMs = prerollGate.baseAt ? now - prerollGate.baseAt : 0;
+    dlog('🕒 前置广告门槛放行：真实播放 ct=', Math.round(ct * 10) / 10, 's（门槛 1.5s）',
+      '| 等待=', prerollGate.waitMs, 'ms');
+  }
+
   // ---- v1.4.8：识别"我们已经把这一支推到结尾，正在等播放器换流" ----
   // 现场（v1.4.7 日志）每支广告强跳后都会再点两次跳过按钮、催三次 play()，
   // 但那一刻 video 是 readyState=0 / duration=NaN —— 媒体已被摘掉，
@@ -2128,6 +2205,7 @@
         // 会紧接着挡住下一条"贴尾暂停 → 续播"（现场 +5501826 的「刚催过」就是这么来的）。
         lastVideoSkip = now;
         try {
+          prerollRelease(ct, now);   // v1.5.6：走加速路径同样视为门槛放行
           if (!alreadyBoosted) {
             rateBoostPrev = v.playbackRate;   // 记住用户原本的速率，之后原样还回去
             v.playbackRate = 16;
@@ -2149,6 +2227,11 @@
         continue;
       }
 
+      // v1.5.6：首个前置广告必须先真实播满 1.5 秒才允许动手（理由见 PREROLL_REAL_PLAY_MS）。
+      // 只约束本视频的第一支：跳过 / 结束 / 换支之后 active=false，pod 里后续广告照旧秒跳。
+      const hold = prerollHold(ct, dur, now);
+      if (hold) { why = why || hold; continue; }
+
       videoSkipTimes.set(v, now);
       lastVideoSkip = now;
       try {
@@ -2162,6 +2245,7 @@
         jumpTarget = Math.max(0, dur - TAIL_LEAD);
         jumpEl = v;
         jumpDur = dur;
+        prerollRelease(ct, now);   // v1.5.6：门槛放行留痕（只对首个广告生效，其余直接返回）
         // v1.5.0：记住"刚落到哪"，0.7 秒后拿它判断元素到底有没有在走
         tailProbeAt = now;
         tailProbeCt = jumpTarget;
@@ -2615,7 +2699,8 @@
         // 再走本地来源。桥是异步的，答复到了会在 onBridgeMsg 里立刻采用。
         askBridge();
         if (!(mainDur > 0)) adoptMainDurFromPage('进广告时');
-        dlog('📺 检测到广告开始（第', adEpoch, '次）');
+        dlog('📺 检测到广告开始（第', adEpoch, '次）',
+          prerollGate.active ? '| 前置广告门槛= 1.5s（真实播放后才放行）' : '');
       } else {
         // v1.4.0 残留看门狗：窗口开着，可媒体一直是正片 —— forceSkip 反正也不会动
         // （mainClipLike / 无参照 两条会拒），多半是 .ad-showing / 覆盖层的残留。
@@ -2646,6 +2731,7 @@
       if (adStateSince) {
         const adStartedAt = adStateSince;      // 汇总要用，先存下来
         adStateSince = 0;
+        prerollGate.active = false;            // v1.5.6：本视频的首个广告已经过去
         residualSince = 0;
         adEndGuardUntil = Date.now() + 1500;   // 广告结束后的保护窗口
         seekFails = 0;
@@ -2671,6 +2757,10 @@
           adMediaWaitMs
             ? '（等首支 ' + firstWait + 'ms / 贴尾后等切流 ' + adCutoverWaitMs + 'ms，占 '
               + Math.round(adMediaWaitMs / total * 100) + '%）'
+            : '',
+          // v1.5.6：首个前置广告为"看起来真的播过"多花的时间，单列出来好判断值不值
+          prerollGate.waitMs
+            ? '| 前置放行等待 ' + prerollGate.waitMs + 'ms'
             : '',
           // v1.5.2：现场那 8.4 秒空窗以前只混在"贴尾后等切流"里，看不出是被摘流
           tailVoidTotalMs
@@ -2785,7 +2875,11 @@
     // 等于自废武功——那之后 dur=1086.5 的广告立刻变成"没有参照"。
     navHandler = () => {
       const id = pageVideoId();
-      if (id && id !== mainDurId) mainDur = 0;
+      if (id && id !== mainDurId) {
+        mainDur = 0;
+        // v1.5.6：换视频 = 新的一次"前置广告"，门槛重新武装
+        resetPrerollGate();
+      }
     };
     try { document.addEventListener('yt-navigate-finish', navHandler); } catch (_) { /* ignore */ }
     lastTickAt = Date.now();

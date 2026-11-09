@@ -81,10 +81,19 @@ function makeVideo(win, opts) {
   const v = win.document.createElement('video');
   let t = opts.currentTime;
   let rate = opts.rate || 1;
+  let baseAt = Date.now();
+  // v1.5.6：advance=true 表示"媒体真的在播"——currentTime 随墙钟前进（暂停或未就绪则不动）。
+  // 首个前置广告的门槛按 ct 前进量算，静态的假 ct 永远满足不了它。
+  const readCt = () => {
+    if (!opts.advance) return t;
+    if (opts.paused) return t;
+    if (opts.readyState !== undefined && opts.readyState < 2) return t;
+    return t + ((Date.now() - baseAt) / 1000) * rate;
+  };
   Object.defineProperty(v, 'duration', { get: () => opts.duration, configurable: true });
   Object.defineProperty(v, 'currentTime', {
-    get: () => t,
-    set: (val) => { if (opts.seekable !== false) t = val; },  // seekable:false 模拟「seek 被忽略」
+    get: () => readCt(),
+    set: (val) => { if (opts.seekable !== false) { t = val; baseAt = Date.now(); } },  // seekable:false 模拟「seek 被忽略」
     configurable: true,
   });
   Object.defineProperty(v, 'paused', { get: () => !!opts.paused, configurable: true });
@@ -95,10 +104,10 @@ function makeVideo(win, opts) {
   });
   Object.defineProperty(v, 'playbackRate', {
     get: () => rate,
-    set: (val) => { rate = val; },
+    set: (val) => { t = readCt(); baseAt = Date.now(); rate = val; },
     configurable: true,
   });
-  v.__getTime = () => t;
+  v.__getTime = () => readCt();
   return v;
 }
 
@@ -172,7 +181,7 @@ function check(name, pass, detail) {
     const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
     const video = makeVideo(new JSDOM('').window, { duration: 15, currentTime: 0.5, paused: false });
     const { win } = await loadPage(html, { video });
-    await sleep(2000);
+    await sleep(4400);   // v1.5.6：ct 不走时由"停滞兜底"放行，之后才强跳
     const t = win.document.querySelector('video').__getTime();
     check('B 广告视频被推到片尾', t > 14 && t <= 15, `currentTime=${t.toFixed(2)}`);
   }
@@ -191,10 +200,10 @@ function check(name, pass, detail) {
   {
     const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
     const video = makeVideo(new JSDOM('').window, {
-      duration: 15, currentTime: 0.5, paused: false, seekable: false, rate: 2,
+      duration: 15, currentTime: 0.5, paused: false, seekable: false, rate: 2, advance: true,
     });
     const { win, player } = await loadPage(html, { video });
-    await sleep(4800);   // 等 seek 连续失败 -> 触发加速
+    await sleep(5600);   // v1.5.6：先过 1.5s 前置门槛，再等 seek 连续失败 -> 触发加速
     const rateDuringAd = win.document.querySelector('video').playbackRate;
     player.classList.remove('ad-showing');
     await sleep(900);
@@ -419,12 +428,12 @@ function check(name, pass, detail) {
     const html = `<div id="movie_player" class="html5-video-player ad-showing">
         <button id="qb" class="ytp-skip-ad-button">跳过</button>
       </div>`;
-    const opts = { duration: 15, currentTime: 1, paused: false };
+    const opts = { duration: 15, currentTime: 1, paused: false, advance: true };
     const video = makeVideo(new JSDOM('').window, opts);
     const { win } = await loadPage(html, { video });
     let clicks = 0;
     win.document.querySelector('#qb').addEventListener('click', () => { clicks += 1; });
-    await sleep(1300);                       // 第一支：点击已落地、且已被视频层强跳
+    await sleep(2200);                       // 第一支：点击已落地、且已被视频层强跳（含 1.5s 门槛）
     const afterFirst = clicks;
     opts.duration = 36;                      // 第二支广告：时长变了，但仍是同一个 <video>
     video.currentTime = 1;
@@ -434,19 +443,21 @@ function check(name, pass, detail) {
       `第1支 clicks=${afterFirst}，累计 clicks=${clicks}`);
   }
 
-  // ---------- Q: 已知正片时长且与广告不同 -> 不再统一等 800ms ----------
-  // v1.3.3：原来 tick 里写死"广告态满 800ms 才强跳"，用户体感就是"广告先播一秒"。
-  // 现在只要能证明"这个 video 不是正片"（时长与 mainDur 明显不同）就立刻动手。
+  // ---------- Q: 首个前置广告必须先真实播满 1.5s 才允许强跳（v1.5.6）----------
+  // v1.5.5 现场：媒体就绪的**同一个 tick** 就 `currentTime=29.5`，那支 30 秒广告
+  // 一帧都没播过 —— 这是 YouTube 反拦截检测里"播放序列不符合预期"最刺眼的形态。
+  // 现在首个广告要按 ct 真实前进 1.5s 才放行（等待不算）。
+  // 反向验证：旧版无门槛，这里只有 ~800ms，本用例必失败。
   {
     const html = `<div id="movie_player" class="html5-video-player"></div>`;
-    const opts = { duration: 600, currentTime: 120, paused: false };
+    const opts = { duration: 600, currentTime: 120, paused: false, advance: true };
     const video = makeVideo(new JSDOM('').window, opts);
     const { win, player, logs } = await loadPage(html, { video, debug: true });
     await sleep(700);                       // 先让 mainDur 记到 600（非广告态）
     opts.duration = 15;                     // 切广告
     video.currentTime = 0.5;
     player.classList.add('ad-showing');
-    await sleep(1600);
+    await sleep(3000);
     // 用日志里的相对时间戳量"从认出广告到真的强跳"的间隔，比按墙钟取整更稳
     const stamp = (re) => {
       for (const line of logs) {
@@ -459,24 +470,40 @@ function check(name, pass, detail) {
     const tAd = stamp('检测到广告开始');
     const tJump = stamp('视频层强跳');
     const delta = tAd >= 0 && tJump >= 0 ? tJump - tAd : -1;
-    check('Q mainDur 已知时广告不再等 800ms 才强跳',
-      delta >= 0 && delta <= 450,
+    check('Q 首个广告按真实播放 1.5s 放行（不再秒跳）',
+      delta >= 1300 && delta <= 2600,
       `认广告 +${tAd}ms → 强跳 +${tJump}ms（间隔 ${delta}ms）`);
   }
 
-  // ---------- R: mainDur 未知（打开链接先播广告）-> 仍保留 800ms 确认窗口 ----------
-  // 这是 Q 的安全边界：证明不了"不是正片"时不能省这 0.8 秒，
-  // 否则可能把正片当成广告推到片尾。
+  // ---------- Q2: 门槛只管第一个广告，pod 里第二支照旧秒跳（v1.5.6）----------
+  // 门槛的目的是让页面加载那段"广告从未开始"变正常，不是给每支广告都加 1.5 秒。
   {
     const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
-    const video = makeVideo(new JSDOM('').window, { duration: 15, currentTime: 0.5, paused: false });
+    const opts = { duration: 15, currentTime: 0.5, paused: false, advance: true };
+    const video = makeVideo(new JSDOM('').window, opts);
+    const { win } = await loadPage(html, { video });
+    await sleep(3000);                       // 第一支：过门槛、已被强跳
+    opts.duration = 22;                      // 第二支：同一个 <video>，时长变了
+    video.currentTime = 0.2;
+    await sleep(1000);
+    const t = win.document.querySelector('video').__getTime();
+    check('Q2 第二支广告不受前置门槛约束（仍秒跳）', t > 21.3, `第二支 currentTime=${t.toFixed(2)}`);
+  }
+
+  // ---------- R: 广告起播 0.5s 内不强跳（安全边界）----------
+  // 证明不了"不是正片"时不能提前动手，否则可能把正片推到片尾；
+  // v1.5.6 之后这条边界由"真实播放 1.5s 门槛"统一兜住。
+  {
+    const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
+    const video = makeVideo(new JSDOM('').window,
+      { duration: 15, currentTime: 0.5, paused: false, advance: true });
     const { win } = await loadPage(html, { video });
     await sleep(500);
     const early = win.document.querySelector('video').__getTime();
-    await sleep(800);
+    await sleep(1300);
     const late = win.document.querySelector('video').__getTime();
-    check('R mainDur 未知时保留 800ms 确认窗口',
-      early < 14 && late > 14, `500ms 时=${early.toFixed(2)}, 1300ms 时=${late.toFixed(2)}`);
+    check('R 广告起播 0.5s 内不强跳，过了门槛才动手',
+      early < 14 && late > 14, `500ms 时=${early.toFixed(2)}, 1800ms 时=${late.toFixed(2)}`);
   }
 
   // ---------- S: 0×0 按钮 + 有尺寸的外壳 -> 点击升级到外壳 ----------
@@ -518,12 +545,12 @@ function check(name, pass, detail) {
   // 元素在 paused=false 时已经是 "potentially playing, waiting for data"，浏览器本来就在取流。
   {
     const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
-    const opts = { duration: 15, currentTime: 0.5, paused: false };
+    const opts = { duration: 15, currentTime: 0.5, paused: false, advance: true };
     const video = makeVideo(new JSDOM('').window, opts);
     let plays = 0;
     video.play = () => { plays += 1; return Promise.resolve(); };
     const { win, logs } = await loadPage(html, { video, debug: true });
-    await sleep(1200);                       // 此时已强跳到 14.95
+    await sleep(2800);                       // 此时已过 1.5s 门槛并强跳到 14.4
     const jumped = win.document.querySelector('video').__getTime();
     const playsBefore = plays;
     opts.readyState = 0;                     // 播放器把媒体摘了（切流）
@@ -540,12 +567,12 @@ function check(name, pass, detail) {
   // play() 是空操作，三次之后媒体照样 readyState=0 挂了 8.5 秒。只会刷日志。
   {
     const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
-    const opts = { duration: 15, currentTime: 0.5, paused: false };
+    const opts = { duration: 15, currentTime: 0.5, paused: false, advance: true };
     const video = makeVideo(new JSDOM('').window, opts);
     let plays = 0;
     video.play = () => { plays += 1; return Promise.resolve(); };
     const { win, logs } = await loadPage(html, { video, debug: true });
-    await sleep(1200);
+    await sleep(2800);
     const jumped = win.document.querySelector('video').__getTime();
     const playsBefore = plays;
     opts.readyState = 0;                     // 摘流，但仍是 paused=false
@@ -600,9 +627,9 @@ function check(name, pass, detail) {
   // 手工从控制台挑行既慢又容易被长文本粘贴截断。改成由内容脚本自己攒缓冲。
   {
     const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
-    const video = makeVideo(new JSDOM('').window, { duration: 15, currentTime: 0.5, paused: false });
+    const video = makeVideo(new JSDOM('').window, { duration: 15, currentTime: 0.5, paused: false, advance: true });
     const { chrome: ch } = await loadPage(html, { video, debug: true });
-    await sleep(1200);
+    await sleep(3200);   // v1.5.6：等首个广告过 1.5s 门槛并强跳后，日志里才有「视频层强跳」
     const resp = ch.__sendMessage({ type: 'ytAutoSkip:dumpLog' });
     const ver = require('../manifest.json').version;
     const first = String((resp && resp.text) || '').split('\n')[0];
@@ -626,9 +653,10 @@ function check(name, pass, detail) {
       resp ? `count=${resp.count}, debug=${resp.debug}` : '无响应');
   }
 
-  // ---------- Z: 广告起播卡在 ct=0 也直接强跳（v1.3.7）----------
-  // 现场日志（v1.3.6）：第二支广告媒体就绪时 ct=0，起播卡住，3 个 tick 后才爬过
-  // 0.3——`ct < 0.3` 这条门白吃 800ms。贴尾 seek 在 ct≈0 时其实照样有效。
+  // ---------- Z: 起播卡在 ct=0 时不硬等门槛（v1.5.6）----------
+  // v1.3.7 的场景不变（广告媒体就绪但时钟不走），但 v1.5.6 加了"真实播放 1.5s"
+  // 门槛。这里守的是门槛的兜底：2 秒内 ct 一点没走 = 广告根本没在播，等下去
+  // 也换不来"真实播放"，直接放行，不许把用户钉在卡死的广告上。
   {
     const html = `<div id="movie_player" class="html5-video-player"></div>`;
     const opts = { duration: 600, currentTime: 120, paused: false };
@@ -638,10 +666,10 @@ function check(name, pass, detail) {
     opts.duration = 15;                      // 切广告
     video.currentTime = 0;                   // 起播卡在 0：时钟一直不走
     player.classList.add('ad-showing');
-    await sleep(900);
+    await sleep(3600);                       // 门槛 2s 停滞兜底 + 跳过 + 强跳
     const t = win.document.querySelector('video').__getTime();
     const earlyLog = logs.some((l) => l.indexOf('起播期 ct=') >= 0);
-    check('Z 广告起播卡在 ct=0 也直接强跳（不等 0.3s）',
+    check('Z 广告卡在 ct=0 时不硬等门槛（停滞兜底放行）',
       t > 14 && earlyLog, `currentTime=${t.toFixed(2)}, 起播期日志=${earlyLog}`);
   }
 
@@ -653,7 +681,7 @@ function check(name, pass, detail) {
     const video = makeVideo(new JSDOM('').window,
       { duration: 15, currentTime: 0, paused: false, seekable: false, rate: 1 });
     const { win, logs } = await loadPage(html, { video, debug: true });
-    await sleep(4400);                       // 宽容 2 次用完（tick 间隔约 1.2s）
+    await sleep(6400);                       // 2s 停滞兜底 + 宽容 2 次用完（tick 间隔约 0.6s）
     const v = win.document.querySelector('video');
     const dropped = logs.some((l) => l.indexOf('起播期 seek 被丢弃') >= 0);
     const capped = logs.some((l) => l.indexOf('起播期已宽容') >= 0);
@@ -768,9 +796,9 @@ function check(name, pass, detail) {
     const html = `<div id="movie_player" class="html5-video-player">
         <div class="ytp-ad-player-overlay"></div>
       </div>`;
-    const video = makeVideo(new JSDOM('').window, { duration: 15, currentTime: 0.5, paused: false });
+    const video = makeVideo(new JSDOM('').window, { duration: 15, currentTime: 0.5, paused: false, advance: true });
     const { win, logs } = await loadPage(html, { video, debug: true });
-    await sleep(2500);
+    await sleep(3000);   // v1.5.6：首个广告要过 1.5s 真实播放门槛
     const t = win.document.querySelector('video').__getTime();
     check('AH 只有广告覆盖层（无 ad-showing）也强跳', t > 14,
       `currentTime=${t.toFixed(2)}, 有强跳日志=${logs.some((l) => l.indexOf('强跳') >= 0)}`);
@@ -874,14 +902,14 @@ function check(name, pass, detail) {
   // 正片时长，参照只该由"换视频"作废。
   {
     const html = `<div id="movie_player" class="html5-video-player"></div>`;
-    const opts = { duration: 5536, currentTime: 300, paused: false };
+    const opts = { duration: 5536, currentTime: 300, paused: false, advance: true };
     const video = makeVideo(new JSDOM('').window, opts);
     const { player, logs } = await loadPage(html, { video, debug: true });
     await sleep(700);                        // 记下 mainDur = 5536
     opts.duration = 15;                      // pod 第一支：15s 短广告
     video.currentTime = 0.5;
     player.classList.add('ad-showing');
-    await sleep(1400);
+    await sleep(2700);                       // v1.5.6：首支要过 1.5s 真实播放门槛
     const afterFirst = video.__getTime();
     opts.duration = 3225;                    // pod 第二支：53 分钟长广告（.ad-showing 不摘）
     video.currentTime = 0;
@@ -929,7 +957,7 @@ function check(name, pass, detail) {
   {
     const html = `<meta itemprop="duration" content="PT16M14S">
       <div id="movie_player" class="html5-video-player"></div>`;
-    const opts = { duration: 313.5, currentTime: 100, paused: false };
+    const opts = { duration: 313.5, currentTime: 100, paused: false, advance: true };
     const video = makeVideo(new JSDOM('').window, opts);
     const { win, player, logs } = await loadPage(html, { video, debug: true });
     await sleep(700);                                   // 先记下上一支视频 mainDur=313.5
@@ -938,7 +966,7 @@ function check(name, pass, detail) {
     opts.duration = 1086.5;                            // 新视频的预播广告
     video.currentTime = 0.5;
     player.classList.add('ad-showing');
-    await sleep(2000);
+    await sleep(3000);                                 // v1.5.6：换视频后门槛重新武装，要真实播 1.5s
     const t = video.__getTime();
     const metaLog = logs.some((l) => l.indexOf('正片时长参照取自页面') >= 0);
     check('AQ 没有 mainDur 时用页面元数据当正片参照',
@@ -972,7 +1000,7 @@ function check(name, pass, detail) {
     opts.duration = 1086.5;                            // 预播广告
     video.currentTime = 0.5;
     win.document.querySelector('#movie_player').classList.add('ad-showing');
-    await sleep(1800);
+    await sleep(3600);                                 // v1.5.6：门槛放宽后（卡住 2s 兜底 / 真实播放 1.5s）
     const t1 = video.__getTime();
     check('AS1 同一视频重发导航事件不作废 mainDur（广告照样跳）',
       t1 > 1085, `currentTime=${t1.toFixed(2)}`);
@@ -997,7 +1025,7 @@ function check(name, pass, detail) {
   {
     const html = `<script>var ytInitialPlayerResponse = {"videoDetails":{"videoId":"newVideoId","title":"t","lengthSeconds":"1201"}};</script>
       <div id="movie_player" class="html5-video-player"></div>`;
-    const opts = { duration: 313.5, currentTime: 100, paused: false };
+    const opts = { duration: 313.5, currentTime: 100, paused: false, advance: true };
     const video = makeVideo(new JSDOM('').window, opts);
     const { win, player, logs } = await loadPage(html, { video, debug: true });
     await sleep(700);                                  // 先记下上一支视频 mainDur=313.5
@@ -1006,7 +1034,7 @@ function check(name, pass, detail) {
     opts.duration = 1086.5;                            // 新视频的预播广告
     video.currentTime = 0.5;
     player.classList.add('ad-showing');
-    await sleep(2200);
+    await sleep(3200);                                 // v1.5.6：换视频后门槛重新武装
     const t = video.__getTime();
     const srcLog = logs.some((l) => l.indexOf('内联playerResponse') >= 0);
     check('AT 没有 meta 时用 playerResponse 的正片时长（id 校验）',
@@ -1056,7 +1084,7 @@ function check(name, pass, detail) {
   // 内联脚本。改成 inj.js 在页面世界读、postMessage 回来。这条用例模拟"桥推送到位"。
   {
     const html = `<div id="movie_player" class="html5-video-player"></div>`;
-    const opts = { duration: 313.5, currentTime: 100, paused: false };
+    const opts = { duration: 313.5, currentTime: 100, paused: false, advance: true };
     const video = makeVideo(new JSDOM('').window, opts);
     const { win, player, logs } = await loadPage(html, { video, debug: true });
     await sleep(400);
@@ -1068,7 +1096,7 @@ function check(name, pass, detail) {
     video.currentTime = 0.5;
     player.classList.add('ad-showing');
     bridgePush(win, 'newVideoId', [{ src: 'player.getPlayerResponse', id: 'newVideoId', dur: 1201 }]);
-    await sleep(2200);
+    await sleep(3200);                                 // v1.5.6：换视频后门槛重新武装
     const t = video.__getTime();
     const gotRef = logs.some((l) => l.indexOf('🎯 正片时长参照取自页面桥') >= 0);
     check('AW 页面桥补上参照后长广告照跳',
@@ -1144,7 +1172,7 @@ function check(name, pass, detail) {
   // 7 毫秒后参照就到位了。那条"每个视频只说一次"的故障报告说的是件并不存在的事。
   {
     const html = `<div id="movie_player" class="html5-video-player"></div>`;
-    const opts = { duration: NaN, currentTime: 0, paused: false };
+    const opts = { duration: NaN, currentTime: 0, paused: false, advance: true };
     const video = makeVideo(new JSDOM('').window, opts);
     const { win, player, logs } = await loadPage(html, { video, debug: true });
     await sleep(300);
@@ -1155,7 +1183,7 @@ function check(name, pass, detail) {
     player.classList.add('ad-showing');
     await sleep(300);
     bridgePush(win, 'newVideoId', [{ src: 'player.getPlayerResponse', id: 'newVideoId', dur: 1201 }]);
-    await sleep(1800);
+    await sleep(3200);                                 // v1.5.6：等过首个广告的 1.5s 门槛
     const t = video.__getTime();
     const cried = logs.some((l) => l.indexOf('❓ 拿不到正片时长参照') >= 0);
     check('BA 桥答复晚到时不误报"拿不到参照"',
@@ -1189,7 +1217,7 @@ function check(name, pass, detail) {
       duration: 60, currentTime: 1, paused: false, seekable: false,
     });
     const { logs } = await loadPage(html, { video, debug: true });
-    await sleep(6000);
+    await sleep(7600);                     // v1.5.6：门槛 2s 停滞兜底 + 两次 seek 失败
     const boosts = logs.filter((l) => l.indexOf('改用 16× 加速') >= 0).length;
     check('BB2 seek 一直无效时 16× 只宣告一次', boosts === 1, `16×宣告=${boosts}`);
   }
@@ -1204,7 +1232,7 @@ function check(name, pass, detail) {
     const opts = { duration: 20, currentTime: 0.5, paused: false };
     const video = makeVideo(new JSDOM('').window, opts);
     const { win, logs } = await loadPage(html, { video, debug: true });
-    await sleep(1200);                       // 已强跳到 19.95
+    await sleep(4400);                       // v1.5.6：门槛（停滞兜底）放行后才强跳到 19.4
     const jumped = win.document.querySelector('video').__getTime();
     opts.readyState = 0;                     // 播放器摘流
     opts.duration = NaN;                     // 旧 UI 残留：按钮还在，但已经没有媒体
@@ -1230,7 +1258,7 @@ function check(name, pass, detail) {
     const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
     const video = makeVideo(new JSDOM('').window, { duration: 20, currentTime: 0.5, paused: false });
     const { logs } = await loadPage(html, { video, debug: true });
-    await sleep(2400);                     // 等确认窗口 + tick 落定
+    await sleep(4000);                     // v1.5.6：门槛 + 确认窗口 + tick 落定
     // v1.5.0：落点看"强跳那一行"本身 —— 之后补发 ended 会把 playhead 移到 dur，
     // 那是本版的新行为，不该拿来否定落点。
     const jump = logs.find((l) => l.indexOf('视频层强跳') >= 0) || '';
@@ -1248,7 +1276,7 @@ function check(name, pass, detail) {
     let plays = 0;
     video.play = () => { plays += 1; return Promise.resolve(); };
     const { win, logs } = await loadPage(html, { video, debug: true });
-    await sleep(1600);                     // 已贴到 19.4
+    await sleep(4400);                     // v1.5.6：门槛放行后已贴到 19.4
     const el = win.document.querySelector('video');
     el.currentTime = 20;                   // 播到真正的结尾
     opts.paused = true;                    // ended 之后元素必然是暂停的
@@ -1292,7 +1320,7 @@ function check(name, pass, detail) {
     video.play = () => { plays += 1; opts.paused = false; return Promise.resolve(); };
     video.addEventListener('ended', () => { endedDispatched += 1; });
     const { win, logs } = await loadPage(html, { video, debug: true });
-    await sleep(1600);                     // 已强跳到 14.4
+    await sleep(4400);                     // v1.5.6：门槛放行后已强跳到 14.4
     opts.paused = true;                    // 现场：贴尾后播放器把元素 pause 了
     await sleep(2000);                     // 越过 700ms 采样
     const el = win.document.querySelector('video');
@@ -1310,7 +1338,7 @@ function check(name, pass, detail) {
     const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
     const video = makeVideo(new JSDOM('').window, { duration: 20, currentTime: 0.5, paused: false });
     const { win, logs } = await loadPage(html, { video, debug: true });
-    await sleep(1300);                     // 已贴到 19.4
+    await sleep(3000);                     // v1.5.6：过门槛后已贴到 19.4
     const el = win.document.querySelector('video');
     const timer = setInterval(() => {
       el.currentTime = Math.min(19.98, el.currentTime + 0.04);
@@ -1333,7 +1361,7 @@ function check(name, pass, detail) {
     let plays = 0;
     video.play = () => { plays += 1; opts.paused = false; return Promise.resolve(); };
     const { win, logs } = await loadPage(html, { video, debug: true });
-    await sleep(1600);                     // 已强跳到 19.4
+    await sleep(4400);                     // v1.5.6：门槛放行后已强跳到 19.4
     const el = win.document.querySelector('video');
     opts.paused = true;
     el.dispatchEvent(new win.Event('ended'));   // 自锁标志：paused 分支从此 continue
@@ -1351,7 +1379,7 @@ function check(name, pass, detail) {
     const html = `<div id="movie_player" class="html5-video-player ad-showing"></div>`;
     const video = makeVideo(new JSDOM('').window, { duration: 20, currentTime: 0.5, paused: false });
     const { win, logs } = await loadPage(html, { video, debug: true });
-    await sleep(1400);                     // 已贴尾
+    await sleep(3000);                     // v1.5.6：过门槛后已贴尾
     const btn = win.document.createElement('button');
     btn.className = 'ytp-skip-ad-button';
     btn.setAttribute('aria-label', '跳过广告');
@@ -1379,7 +1407,7 @@ function check(name, pass, detail) {
     let plays = 0;
     video.play = () => { plays += 1; return Promise.resolve(); };
     const { win, logs } = await loadPage(html, { video, debug: true });
-    await sleep(1200);                       // 已强跳到 14.4
+    await sleep(4400);                       // v1.5.6：门槛放行后已强跳到 14.4
     const jumped = win.document.querySelector('video').__getTime();
     const playsBefore = plays;
     opts.readyState = 0;
@@ -1402,7 +1430,7 @@ function check(name, pass, detail) {
     const video = makeVideo(new JSDOM('').window, opts);
     video.play = () => Promise.resolve();
     const { win, logs } = await loadPage(html, { video, debug: true });
-    await sleep(1200);                       // 已贴尾
+    await sleep(4400);                       // v1.5.6：门槛放行后已贴尾
     opts.readyState = 0;
     opts.duration = NaN;                     // 摘流，进入空窗
     await sleep(5200);                       // 空窗 > 2s，逐秒诊断该出现
@@ -1431,7 +1459,7 @@ function check(name, pass, detail) {
     const video = makeVideo(new JSDOM('').window, opts);
     video.play = () => Promise.resolve();
     const { win, logs } = await loadPage(html, { video, debug: true });
-    await sleep(1300);                     // 已强跳到 29.4
+    await sleep(4400);                     // v1.5.6：门槛放行后已强跳到 29.4
     opts.readyState = 0;
     opts.duration = NaN;                   // 摘流 —— 现场的 dur=NaN
     opts.paused = true;                    // 现场空窗期一直是 paused=true
